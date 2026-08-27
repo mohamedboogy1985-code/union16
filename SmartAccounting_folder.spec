@@ -1,8 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
-# spec للبناء كملف EXE واحد (onefile)
+# spec للبناء كمجلد تطبيق (onedir) - الأكثر استقراراً على Windows
 import os
 
-# أضف الملفات المساعدة الموجودة فقط (قاعدة البيانات والملفات النموذجية)
 datas = []
 for f in ["accounting.db", "sample_import.xlsx", "sample_payroll.xlsx"]:
     if os.path.exists(f):
@@ -31,20 +30,27 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='SmartAccounting',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='SmartAccounting',
 )

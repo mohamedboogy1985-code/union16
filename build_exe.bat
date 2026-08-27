@@ -3,17 +3,14 @@ title Build SmartAccounting EXE
 cd /d "%~dp0"
 
 echo =======================================
-echo Building SmartAccounting EXE...
+echo Building SmartAccounting EXE (onefile)...
 echo =======================================
 
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python -m pip install pyinstaller
 
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name SmartAccounting ^
-  --add-data "accounting.db;." ^
-  --add-data "sample_import.xlsx;." ^
-  main.py
+python -m PyInstaller --noconfirm --clean SmartAccounting.spec
 
 echo.
 echo =======================================

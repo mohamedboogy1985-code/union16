@@ -52,13 +52,21 @@ def init_db():
         debit REAL DEFAULT 0,
         credit REAL DEFAULT 0,
         line_description TEXT,
+        cost_center_id INTEGER,
         FOREIGN KEY(entry_id) REFERENCES journal_entries(id),
-        FOREIGN KEY(account_id) REFERENCES accounts(id)
+        FOREIGN KEY(account_id) REFERENCES accounts(id),
+        FOREIGN KEY(cost_center_id) REFERENCES cost_centers(id)
     )""")
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_entries_date ON journal_entries(entry_date)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_lines_entry ON journal_lines(entry_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_lines_account ON journal_lines(account_id)")
+
+    # إضافة عمود مركز التكلفة لقواعد البيانات القديمة (ترحيل آمن)
+    cols = [r[1] for r in cur.execute("PRAGMA table_info(journal_lines)").fetchall()]
+    if "cost_center_id" not in cols:
+        cur.execute("ALTER TABLE journal_lines ADD COLUMN cost_center_id INTEGER")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_lines_cost_center ON journal_lines(cost_center_id)")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS payroll_imports (
@@ -93,6 +101,14 @@ def init_db():
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_payroll_rows_name ON payroll_rows(employee_name)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_payroll_rows_import ON payroll_rows(import_id)")
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS cost_centers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE,
+        description TEXT,
+        created_at TEXT
+    )""")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS bank_settlements (

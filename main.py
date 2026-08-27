@@ -25,6 +25,12 @@ except Exception:
 from db import init_db, get_connection, DB_PATH
 from importer import import_excel_file
 from payroll_importer import import_payroll_excel
+from pdf_reports import (
+    pdf_available as pdf_lib_available,
+    build_table_pdf,
+    build_voucher_pdf,
+    build_settlement_pdf,
+)
 from services import (
     dashboard_summary,
     list_entries,
@@ -47,6 +53,11 @@ from services import (
     bank_settlement_history,
     save_bank_settlement,
     post_bank_settlement_adjustment,
+    cost_centers_list,
+    add_cost_center,
+    rename_cost_center,
+    delete_cost_center,
+    cost_center_report,
 )
 
 
@@ -90,9 +101,9 @@ class EntryEditor(tk.Toplevel):
         ttk.Button(tools, text="حذف السطر المحدد", command=self.remove_selected).pack(side="left", padx=4)
         ttk.Button(tools, text="حفظ", command=self.save).pack(side="left", padx=4)
 
-        self.tree = ttk.Treeview(self, columns=("account", "debit", "credit", "desc"), show="headings", height=14)
+        self.tree = ttk.Treeview(self, columns=("account", "debit", "credit", "desc", "cost"), show="headings", height=14)
         for c, h, w in [
-            ("account", "الحساب", 420), ("debit", "مدين", 120), ("credit", "دائن", 120), ("desc", "بيان السطر", 280)
+            ("account", "الحساب", 380), ("debit", "مدين", 110), ("credit", "دائن", 110), ("desc", "بيان السطر", 220), ("cost", "مركز التكلفة", 150)
         ]:
             self.tree.heading(c, text=h)
             self.tree.column(c, width=w, anchor="center")
@@ -104,16 +115,19 @@ class EntryEditor(tk.Toplevel):
         self.line_debit = tk.StringVar()
         self.line_credit = tk.StringVar()
         self.line_desc = tk.StringVar()
+        self.line_cost = tk.StringVar()
 
         ttk.Label(editor, text="الحساب").pack(side="right", padx=4)
-        self.account_combo = ttk.Combobox(editor, textvariable=self.line_account, width=40, values=ledger_accounts())
+        self.account_combo = ttk.Combobox(editor, textvariable=self.line_account, width=36, values=ledger_accounts())
         self.account_combo.pack(side="right", padx=4)
         ttk.Label(editor, text="مدين").pack(side="right", padx=4)
-        ttk.Entry(editor, textvariable=self.line_debit, width=12).pack(side="right", padx=4)
+        ttk.Entry(editor, textvariable=self.line_debit, width=11).pack(side="right", padx=4)
         ttk.Label(editor, text="دائن").pack(side="right", padx=4)
-        ttk.Entry(editor, textvariable=self.line_credit, width=12).pack(side="right", padx=4)
+        ttk.Entry(editor, textvariable=self.line_credit, width=11).pack(side="right", padx=4)
         ttk.Label(editor, text="بيان السطر").pack(side="right", padx=4)
-        ttk.Entry(editor, textvariable=self.line_desc, width=30).pack(side="right", padx=4)
+        ttk.Entry(editor, textvariable=self.line_desc, width=22).pack(side="right", padx=4)
+        ttk.Label(editor, text="مركز التكلفة").pack(side="right", padx=4)
+        ttk.Combobox(editor, textvariable=self.line_cost, width=16, values=[""] + [c["name"] for c in cost_centers_list()]).pack(side="right", padx=4)
         ttk.Button(editor, text="تطبيق على السطر المحدد", command=self.apply_line).pack(side="left", padx=4)
 
         self.status = ttk.Label(self, text="")
@@ -127,7 +141,7 @@ class EntryEditor(tk.Toplevel):
             self.add_line()
 
     def add_line(self):
-        iid = self.tree.insert("", "end", values=("", "0.00", "0.00", ""))
+        iid = self.tree.insert("", "end", values=("", "0.00", "0.00", "", self.line_cost.get()))
         self.tree.selection_set(iid)
         self.load_selected()
 
@@ -145,6 +159,7 @@ class EntryEditor(tk.Toplevel):
         self.line_debit.set(vals[1] if len(vals) > 1 else "0.00")
         self.line_credit.set(vals[2] if len(vals) > 2 else "0.00")
         self.line_desc.set(vals[3] if len(vals) > 3 else "")
+        self.line_cost.set(vals[4] if len(vals) > 4 else "")
 
     def apply_line(self):
         sel = self.tree.selection()
@@ -155,7 +170,8 @@ class EntryEditor(tk.Toplevel):
             self.line_account.get().strip(),
             self.line_debit.get().strip() or "0.00",
             self.line_credit.get().strip() or "0.00",
-            self.line_desc.get().strip()
+            self.line_desc.get().strip(),
+            self.line_cost.get().strip()
         ))
         self.update_status()
 
@@ -176,9 +192,10 @@ class EntryEditor(tk.Toplevel):
             FROM journal_entries WHERE id=?
         """, (self.entry_id,)).fetchone()
         lines = cur.execute("""
-            SELECT a.name, jl.debit, jl.credit, jl.line_description
+            SELECT a.name, jl.debit, jl.credit, jl.line_description, cc.name
             FROM journal_lines jl
             JOIN accounts a ON a.id = jl.account_id
+            LEFT JOIN cost_centers cc ON cc.id = jl.cost_center_id
             WHERE jl.entry_id=?
             ORDER BY jl.id
         """, (self.entry_id,)).fetchall()
@@ -191,19 +208,19 @@ class EntryEditor(tk.Toplevel):
         for iid in self.tree.get_children():
             self.tree.delete(iid)
         for row in lines:
-            self.tree.insert("", "end", values=(row[0], f"{float(row[1] or 0):.2f}", f"{float(row[2] or 0):.2f}", row[3] or ""))
+            self.tree.insert("", "end", values=(row[0], f"{float(row[1] or 0):.2f}", f"{float(row[2] or 0):.2f}", row[3] or "", row[4] or ""))
         self.update_status()
 
     def save(self):
         rows = []
         total_debit = total_credit = 0.0
         for iid in self.tree.get_children():
-            account, debit, credit, desc = self.tree.item(iid, "values")
+            account, debit, credit, desc, cost = self.tree.item(iid, "values")
             if not account.strip():
                 continue
             d = float(debit or 0)
             c = float(credit or 0)
-            rows.append((account.strip(), d, c, desc.strip()))
+            rows.append((account.strip(), d, c, desc.strip(), cost.strip()))
             total_debit += d
             total_credit += c
 
@@ -228,6 +245,12 @@ class EntryEditor(tk.Toplevel):
                         (code, name, category, normal_side))
             return cur.lastrowid
 
+        def resolve_cost_center(name):
+            if not name:
+                return None
+            row = cur.execute("SELECT id FROM cost_centers WHERE name=?", (name,)).fetchone()
+            return row[0] if row else None
+
         if self.entry_id:
             cur.execute("DELETE FROM journal_lines WHERE entry_id=?", (self.entry_id,))
             cur.execute("""
@@ -243,12 +266,13 @@ class EntryEditor(tk.Toplevel):
             """, (self.date_var.get(), self.ref_var.get(), self.desc_var.get(), total_debit, total_credit, None, None))
             entry_id = cur.lastrowid
 
-        for account_name, d, c, desc in rows:
+        for account_name, d, c, desc, cost_name in rows:
             account_id = ensure_account(account_name)
+            cost_id = resolve_cost_center(cost_name)
             cur.execute("""
-                INSERT INTO journal_lines(entry_id, account_id, debit, credit, line_description)
-                VALUES (?,?,?,?,?)
-            """, (entry_id, account_id, d, c, desc))
+                INSERT INTO journal_lines(entry_id, account_id, debit, credit, line_description, cost_center_id)
+                VALUES (?,?,?,?,?,?)
+            """, (entry_id, account_id, d, c, desc, cost_id))
 
         conn.commit()
         conn.close()
@@ -309,6 +333,7 @@ class AccountingApp(tk.Tk):
             ("accounts", "الحسابات"),
             ("debtors", "المدينون والسلف"),
             ("revexp", "الإيرادات والمصروفات"),
+            ("cost", "مراكز التكلفة"),
             ("settlements", "التسويات البنكية"),
             ("payroll", "المرتبات"),
             ("reports", "التقارير"),
@@ -323,6 +348,7 @@ class AccountingApp(tk.Tk):
         self._build_accounts()
         self._build_debtors()
         self._build_revexp()
+        self._build_cost()
         self._build_settlements()
         self._build_payroll()
         self._build_reports()
@@ -390,99 +416,15 @@ class AccountingApp(tk.Tk):
 
 
     def _rtl_text(self, text):
-        text = str(text or "")
-        if PDF_AVAILABLE:
-            try:
-                return get_display(arabic_reshaper.reshape(text))
-            except Exception:
-                return text
-        return text
+        from pdf_reports import rtl_text
+        return rtl_text(text)
 
     def _pdf_font_name(self):
-        candidates = [
-            os.path.join(os.environ.get("WINDIR", "C:/Windows"), "Fonts", "arial.ttf"),
-            os.path.join(os.environ.get("WINDIR", "C:/Windows"), "Fonts", "arialuni.ttf"),
-            os.path.join(os.environ.get("WINDIR", "C:/Windows"), "Fonts", "Tahoma.ttf"),
-            os.path.join(os.environ.get("WINDIR", "C:/Windows"), "Fonts", "times.ttf"),
-        ]
-        for path in candidates:
-            if os.path.exists(path):
-                try:
-                    pdfmetrics.registerFont(TTFont("ArabicUI", path))
-                    return "ArabicUI"
-                except Exception:
-                    pass
-        return "Helvetica"
+        from pdf_reports import pdf_font_name
+        return pdf_font_name()
 
     def _create_settlement_pdf(self, path, payload):
-        font_name = self._pdf_font_name()
-        doc = SimpleDocTemplate(path, pagesize=A4, rightMargin=1.6*cm, leftMargin=1.6*cm, topMargin=1.5*cm, bottomMargin=1.5*cm)
-        styles = getSampleStyleSheet()
-        title_style = ParagraphStyle("title_ar", parent=styles["Title"], fontName=font_name, fontSize=18, leading=24, alignment=TA_CENTER)
-        meta_style = ParagraphStyle("meta_ar", parent=styles["Normal"], fontName=font_name, fontSize=10, leading=14, alignment=TA_RIGHT)
-        cell_style = ParagraphStyle("cell_ar", parent=styles["Normal"], fontName=font_name, fontSize=11, leading=15, alignment=TA_RIGHT)
-
-        data_pairs = [
-            ("اسم البنك", payload.get("bank_name")),
-            ("السنة", payload.get("year")),
-            ("الرصيد الافتتاحي", payload.get("opening_balance")),
-            ("إجمالي المقبوضات", payload.get("receipts")),
-            ("إجمالي المدفوعات", payload.get("payments")),
-            ("الرصيد الدفتري آخر الفترة", payload.get("book_balance_end")),
-            ("شيكات تحت التحصيل", payload.get("checks_under_collection")),
-            ("شيك مسحوب ولم يصرف 1", payload.get("uncashed_check1")),
-            ("شيك مسحوب ولم يصرف 2", payload.get("uncashed_check2")),
-            ("الرصيد بعد التسوية", payload.get("final_bank_balance")),
-            ("رصيد كشف الحساب", payload.get("bank_statement_balance")),
-            ("فرق التسوية", payload.get("discrepancy")),
-            ("ملاحظات", payload.get("notes") or "-"),
-        ]
-
-        story = []
-        story.append(Paragraph(self._rtl_text(payload.get("title", "مذكرة تسوية بنكية")), title_style))
-        story.append(Spacer(1, 0.25 * cm))
-        story.append(Paragraph(self._rtl_text(f"تاريخ الطباعة: {payload.get('generated_at', '')}"), meta_style))
-        story.append(Spacer(1, 0.35 * cm))
-
-        table_rows = []
-        for label, value in data_pairs:
-            table_rows.append([
-                Paragraph(self._rtl_text(str(value)), cell_style),
-                Paragraph(self._rtl_text(label), cell_style),
-            ])
-
-        tbl = Table(table_rows, colWidths=[10.5 * cm, 6.0 * cm], hAlign="RIGHT")
-        tbl.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), colors.whitesmoke),
-            ("BACKGROUND", (1, 0), (1, -1), colors.HexColor("#DCE6F1")),
-            ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-            ("FONTNAME", (0, 0), (-1, -1), font_name),
-            ("FONTSIZE", (0, 0), (-1, -1), 11),
-            ("LEADING", (0, 0), (-1, -1), 15),
-            ("GRID", (0, 0), (-1, -1), 0.6, colors.HexColor("#8EAADB")),
-            ("BOX", (0, 0), (-1, -1), 1.0, colors.HexColor("#5B9BD5")),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-            ("LEFTPADDING", (0, 0), (-1, -1), 10),
-            ("TOPPADDING", (0, 0), (-1, -1), 8),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-        ]))
-        story.append(tbl)
-        story.append(Spacer(1, 0.45 * cm))
-        sign_tbl = Table([
-            [Paragraph(self._rtl_text("إعداد / مراجعة"), cell_style), Paragraph(self._rtl_text("اعتماد"), cell_style)]
-        ], colWidths=[8.0 * cm, 8.0 * cm], hAlign="CENTER")
-        sign_tbl.setStyle(TableStyle([
-            ("BOX", (0, 0), (-1, -1), 0.7, colors.grey),
-            ("INNERGRID", (0, 0), (-1, -1), 0.7, colors.grey),
-            ("TOPPADDING", (0, 0), (-1, -1), 24),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 24),
-            ("FONTNAME", (0, 0), (-1, -1), font_name),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ]))
-        story.append(sign_tbl)
-        doc.build(story)
+        build_settlement_pdf(path, payload)
 
     def import_journal(self):
         path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")])
@@ -564,6 +506,8 @@ class AccountingApp(tk.Tk):
         ttk.Button(top, text="تعديل القيد المحدد", command=self.open_selected_entry).pack(side="left", padx=4)
         ttk.Button(top, text="حذف القيد المحدد", command=self.delete_selected_entry).pack(side="left", padx=4)
         ttk.Button(top, text="تصدير", command=self.export_journal).pack(side="left", padx=4)
+        ttk.Button(top, text="طباعة سند القيد", command=self.print_entry_voucher).pack(side="left", padx=4)
+        ttk.Button(top, text="طباعة PDF", command=self.print_journal_pdf).pack(side="left", padx=4)
         ttk.Label(top, text="بحث").pack(side="right", padx=4)
         ent = ttk.Entry(top, textvariable=self.journal_search, width=40); ent.pack(side="right", padx=4)
         ent.bind("<KeyRelease>", lambda e: self.refresh_journal())
@@ -574,9 +518,9 @@ class AccountingApp(tk.Tk):
         self.journal_tree.bind("<<TreeviewSelect>>", lambda e: self.refresh_entry_lines())
         lines_box = ttk.LabelFrame(journal, text="سطور القيد")
         lines_box.pack(fill="both", expand=False, padx=10, pady=(0, 8))
-        lf, self.entry_lines_tree = self._tree(lines_box, ("account", "debit", "credit", "desc"),
-                                               ("الحساب", "مدين", "دائن", "بيان السطر"),
-                                               (420, 110, 110, 360))
+        lf, self.entry_lines_tree = self._tree(lines_box, ("account", "debit", "credit", "desc", "cost"),
+                                               ("الحساب", "مدين", "دائن", "بيان السطر", "مركز التكلفة"),
+                                               (360, 110, 110, 300, 140))
         lf.pack(fill="both", expand=True, padx=6, pady=6)
 
         add_screen = self._screen(nb, "إضافة قيد جديد")
@@ -605,6 +549,7 @@ class AccountingApp(tk.Tk):
         self.ledger_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_ledger())
         ttk.Label(top, text="الحساب").pack(side="right", padx=4)
         ttk.Button(top, text="تحديث", command=self.refresh_ledger).pack(side="left", padx=4)
+        ttk.Button(top, text="طباعة PDF", command=self.print_ledger_pdf).pack(side="left", padx=4)
         tf, self.ledger_tree = self._tree(ledger, ("date", "ref", "desc", "debit", "credit", "balance"),
                                           ("التاريخ", "المرجع", "البيان", "مدين", "دائن", "الرصيد"),
                                           (100, 120, 420, 110, 110, 120))
@@ -612,6 +557,7 @@ class AccountingApp(tk.Tk):
 
         trial = self._screen(nb, "ميزان المراجعة")
         ttk.Button(trial, text="تصدير", command=self.export_trial).pack(anchor="w", padx=10, pady=8)
+        ttk.Button(trial, text="طباعة PDF", command=self.print_trial_pdf).pack(anchor="w", padx=10)
         tf, self.trial_tree = self._tree(trial, ("account", "debit", "credit", "net_debit", "net_credit"),
                                          ("الحساب", "إجمالي مدين", "إجمالي دائن", "رصيد مدين", "رصيد دائن"),
                                          (440, 120, 120, 120, 120))
@@ -635,6 +581,7 @@ class AccountingApp(tk.Tk):
         ent.bind("<KeyRelease>", lambda e: self.refresh_debtors_people())
         ttk.Button(top, text="تحديث", command=self.refresh_debtors_people).pack(side="left", padx=4)
         ttk.Button(top, text="تصدير", command=self.export_debtors).pack(side="left", padx=4)
+        ttk.Button(top, text="طباعة PDF", command=self.print_debtor_pdf).pack(side="left", padx=4)
         body = ttk.Panedwindow(debt, orient="horizontal"); body.pack(fill="both", expand=True, padx=10, pady=8)
         left = ttk.LabelFrame(body, text="الأشخاص"); right = ttk.Frame(body)
         body.add(left, weight=1); body.add(right, weight=4)
@@ -675,6 +622,7 @@ class AccountingApp(tk.Tk):
 
         vouchers = self._screen(nb, "أذون الصرف الذكية")
         ttk.Button(vouchers, text="تصدير", command=self.export_vouchers).pack(anchor="w", padx=10, pady=8)
+        ttk.Button(vouchers, text="طباعة أذن الصرف المحدد", command=self.print_selected_voucher).pack(anchor="w", padx=10, pady=8)
         tf, self.vouchers_tree = self._tree(vouchers, ("id", "date", "ref", "desc", "source", "target", "amount"),
                                             ("رقم", "التاريخ", "المرجع", "البيان", "من", "إلى", "المبلغ"),
                                             (70, 100, 120, 320, 240, 240, 120))
@@ -696,6 +644,7 @@ class AccountingApp(tk.Tk):
         e.bind("<KeyRelease>", lambda ev: self.refresh_revexp())
         ttk.Button(top, text="تحديث", command=self.refresh_revexp).pack(side="left", padx=4)
         ttk.Button(top, text="تصدير", command=self.export_revexp).pack(side="left", padx=4)
+        ttk.Button(top, text="طباعة PDF", command=self.print_revexp_pdf).pack(side="left", padx=4)
         self.revexp_kpis = self._kpi_row(det)
         tf, self.revexp_tree = self._tree(det, ("date", "ref", "account", "desc", "debit", "credit", "balance"),
                                           ("التاريخ", "المرجع", "الحساب", "البيان", "مدين", "دائن", "الرصيد"),
@@ -714,6 +663,51 @@ class AccountingApp(tk.Tk):
         tf.pack(fill="both", expand=True, padx=10, pady=8)
 
 
+
+    def _build_cost(self):
+        nb = self._subnb(self.tabs["cost"])
+
+        mgmt = self._screen(nb, "إدارة مراكز التكلفة")
+        top = ttk.Frame(mgmt); top.pack(fill="x", padx=10, pady=8)
+        self.cost_name_var = tk.StringVar()
+        self.cost_desc_var = tk.StringVar()
+        ttk.Label(top, text="اسم المركز").pack(side="right", padx=4)
+        ttk.Entry(top, textvariable=self.cost_name_var, width=26).pack(side="right", padx=4)
+        ttk.Label(top, text="الوصف").pack(side="right", padx=4)
+        ttk.Entry(top, textvariable=self.cost_desc_var, width=34).pack(side="right", padx=4)
+        ttk.Button(top, text="إضافة", command=self.add_cost_center).pack(side="left", padx=4)
+        ttk.Button(top, text="إعادة تسمية المحدد", command=self.rename_cost_center).pack(side="left", padx=4)
+        ttk.Button(top, text="حذف المحدد", command=self.delete_cost_center).pack(side="left", padx=4)
+        ttk.Button(top, text="تحديث", command=self.refresh_cost_centers).pack(side="left", padx=4)
+        ttk.Label(mgmt, text="لتوزيع الحركات على المراكز: افتح القيد من دفتر اليومية ثم اختر المركز لكل سطر قبل الحفظ.",
+                  style="Section.TLabel").pack(anchor="e", padx=10, pady=4)
+        tf, self.cost_centers_tree = self._tree(mgmt, ("id", "name", "desc", "created", "movements"),
+                                                ("رقم", "اسم المركز", "الوصف", "تاريخ الإنشاء", "عدد الحركات"),
+                                                (70, 260, 320, 170, 110))
+        tf.pack(fill="both", expand=True, padx=10, pady=8)
+        self.cost_centers_tree.bind("<<TreeviewSelect>>", lambda e: self.load_selected_cost_center())
+
+        rep = self._screen(nb, "تقرير حركة المراكز")
+        top = ttk.Frame(rep); top.pack(fill="x", padx=10, pady=8)
+        self.cost_report_center_var = tk.StringVar(value="كل المراكز")
+        self.cost_report_combo = ttk.Combobox(top, textvariable=self.cost_report_center_var, width=34, state="readonly")
+        self.cost_report_combo.pack(side="right", padx=4)
+        self.cost_report_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_cost_report())
+        ttk.Label(top, text="المركز").pack(side="right", padx=4)
+        ttk.Label(top, text="من تاريخ").pack(side="right", padx=4)
+        self.cost_from_var = tk.StringVar()
+        ttk.Entry(top, textvariable=self.cost_from_var, width=12).pack(side="right", padx=4)
+        ttk.Label(top, text="إلى تاريخ").pack(side="right", padx=4)
+        self.cost_to_var = tk.StringVar()
+        ttk.Entry(top, textvariable=self.cost_to_var, width=12).pack(side="right", padx=4)
+        ttk.Button(top, text="تحديث", command=self.refresh_cost_report).pack(side="left", padx=4)
+        ttk.Button(top, text="تصدير Excel", command=self.export_cost_report).pack(side="left", padx=4)
+        ttk.Button(top, text="طباعة PDF", command=self.print_cost_report).pack(side="left", padx=4)
+        self.cost_kpis = self._kpi_row(rep)
+        tf, self.cost_report_tree = self._tree(rep, ("date", "ref", "desc", "account", "debit", "credit", "balance"),
+                                               ("التاريخ", "المرجع", "البيان", "الحساب", "مدين", "دائن", "الرصيد"),
+                                               (100, 120, 320, 260, 100, 100, 120))
+        tf.pack(fill="both", expand=True, padx=10, pady=8)
 
     def _build_settlements(self):
         nb = self._subnb(self.tabs["settlements"])
@@ -981,6 +975,7 @@ class AccountingApp(tk.Tk):
         self.payroll_search_var = tk.StringVar()
         ttk.Button(top, text="استيراد ملف المرتبات", command=self.import_payroll).pack(side="left", padx=4)
         ttk.Button(top, text="تصدير بيانات المرتبات", command=self.export_payroll).pack(side="left", padx=4)
+        ttk.Button(top, text="طباعة PDF", command=self.print_payroll_pdf).pack(side="left", padx=4)
         ttk.Label(top, text="بحث").pack(side="right", padx=4)
         ent = ttk.Entry(top, textvariable=self.payroll_search_var, width=35); ent.pack(side="right", padx=4)
         ent.bind("<KeyRelease>", lambda e: self.refresh_payroll())
@@ -1012,6 +1007,7 @@ class AccountingApp(tk.Tk):
         ttk.Label(top, text="الشخص").pack(side="right", padx=4)
         ttk.Button(top, text="تحديث", command=self.refresh_person_report).pack(side="left", padx=4)
         ttk.Button(top, text="تصدير", command=self.export_person_report).pack(side="left", padx=4)
+        ttk.Button(top, text="طباعة PDF", command=self.print_person_pdf).pack(side="left", padx=4)
         tf, self.rep_person_tree = self._tree(person, ("date", "ref", "account", "desc", "debit", "credit", "balance"),
                                               ("التاريخ", "المرجع", "الحساب", "البيان", "مدين", "دائن", "الرصيد"),
                                               (100, 120, 240, 360, 100, 100, 120))
@@ -1026,6 +1022,7 @@ class AccountingApp(tk.Tk):
         ttk.Label(top, text="الحساب").pack(side="right", padx=4)
         ttk.Button(top, text="تحديث", command=self.refresh_account_report).pack(side="left", padx=4)
         ttk.Button(top, text="تصدير", command=self.export_account_report).pack(side="left", padx=4)
+        ttk.Button(top, text="طباعة PDF", command=self.print_account_pdf).pack(side="left", padx=4)
         tf, self.rep_account_tree = self._tree(account, ("date", "ref", "desc", "debit", "credit", "balance"),
                                                ("التاريخ", "المرجع", "البيان", "مدين", "دائن", "الرصيد"),
                                                (100, 120, 420, 100, 100, 120))
@@ -1051,6 +1048,7 @@ class AccountingApp(tk.Tk):
 
         rev = self._screen(nb, "تقرير الإيرادات")
         ttk.Button(rev, text="تحديث", command=lambda: self.refresh_pattern_report("revenues")).pack(anchor="w", padx=10, pady=8)
+        ttk.Button(rev, text="طباعة PDF", command=lambda: self.print_pattern_pdf("revenues")).pack(anchor="w", padx=10)
         tf, self.rep_revenues_tree = self._tree(rev, ("date", "ref", "account", "desc", "debit", "credit", "balance"),
                                                 ("التاريخ", "المرجع", "الحساب", "البيان", "مدين", "دائن", "الرصيد"),
                                                 (100,120,260,360,100,100,120))
@@ -1058,6 +1056,7 @@ class AccountingApp(tk.Tk):
 
         exp = self._screen(nb, "تقرير المصروفات")
         ttk.Button(exp, text="تحديث", command=lambda: self.refresh_pattern_report("expenses")).pack(anchor="w", padx=10, pady=8)
+        ttk.Button(exp, text="طباعة PDF", command=lambda: self.print_pattern_pdf("expenses")).pack(anchor="w", padx=10)
         tf, self.rep_expenses_tree = self._tree(exp, ("date", "ref", "account", "desc", "debit", "credit", "balance"),
                                                 ("التاريخ", "المرجع", "الحساب", "البيان", "مدين", "دائن", "الرصيد"),
                                                 (100,120,260,360,100,100,120))
@@ -1065,6 +1064,7 @@ class AccountingApp(tk.Tk):
 
         jr = self._screen(nb, "تقرير يومية مفصل")
         ttk.Button(jr, text="تحديث", command=self.refresh_journal).pack(anchor="w", padx=10, pady=8)
+        ttk.Button(jr, text="طباعة PDF", command=self.print_rep_journal_pdf).pack(anchor="w", padx=10)
         tf, self.rep_journal_tree = self._tree(jr, ("id", "date", "ref", "desc", "debit", "credit"),
                                                ("رقم", "التاريخ", "المرجع", "البيان", "مدين", "دائن"),
                                                (70,100,120,460,110,110))
@@ -1072,6 +1072,7 @@ class AccountingApp(tk.Tk):
 
         td = self._screen(nb, "تقرير ميزان مراجعة تفصيلي")
         ttk.Button(td, text="تحديث", command=self.refresh_trial).pack(anchor="w", padx=10, pady=8)
+        ttk.Button(td, text="طباعة PDF", command=self.print_trial_pdf).pack(anchor="w", padx=10)
         tf, self.rep_trial_tree = self._tree(td, ("account", "debit", "credit", "net_debit", "net_credit"),
                                              ("الحساب", "إجمالي مدين", "إجمالي دائن", "رصيد مدين", "رصيد دائن"),
                                              (440,120,120,120,120))
@@ -1115,9 +1116,294 @@ class AccountingApp(tk.Tk):
             "- استيراد يومية أمريكية من Excel\n"
             "- استيراد مرتبات من Excel\n"
             "- تصدير الشاشات الرئيسية إلى Excel\n"
-            "- يمكن تطوير الصلاحيات والطباعة وPDF لاحقاً"
+            "- طباعة PDF لكل الشاشات: اليومية، الميزان، الأستاذ العام، كشوف المدينين، الإيرادات والمصروفات، المرتبات\n"
+            "- طباعة سندات رسمية: سند قيد وأذن صرف من الشاشة مباشرة\n"
+            "- مراكز تكلفة: إدارة المراكز وتوزيع سطور القيود عليها مع تقرير حركة\n"
+            "- يمكن تطوير الصلاحيات ومتعدد المستخدمين لاحقاً"
         )
         ttk.Label(sysf, text=txt, justify="right").pack(anchor="e", padx=10, pady=10)
+
+    # ---------- cost centers actions ----------
+    def load_selected_cost_center(self):
+        sel = self.cost_centers_tree.selection()
+        if not sel:
+            return
+        vals = self.cost_centers_tree.item(sel[0], "values")
+        self.cost_name_var.set(vals[1] if len(vals) > 1 else "")
+        self.cost_desc_var.set(vals[2] if len(vals) > 2 else "")
+
+    def add_cost_center(self):
+        result = add_cost_center(self.cost_name_var.get(), self.cost_desc_var.get())
+        self.refresh_cost_centers()
+        messagebox.showinfo("مراكز التكلفة", result)
+
+    def rename_cost_center(self):
+        sel = self.cost_centers_tree.selection()
+        if not sel:
+            messagebox.showwarning("تنبيه", "اختر مركز تكلفة أولاً")
+            return
+        center_id = int(self.cost_centers_tree.item(sel[0], "values")[0])
+        result = rename_cost_center(center_id, self.cost_name_var.get())
+        self.refresh_cost_centers()
+        messagebox.showinfo("مراكز التكلفة", result)
+
+    def delete_cost_center(self):
+        sel = self.cost_centers_tree.selection()
+        if not sel:
+            messagebox.showwarning("تنبيه", "اختر مركز تكلفة أولاً")
+            return
+        center_id = int(self.cost_centers_tree.item(sel[0], "values")[0])
+        if not messagebox.askyesno("تأكيد", "حذف المركز؟ سيتم فك ارتباطه من كل القيود دون حذف القيود."):
+            return
+        result = delete_cost_center(center_id)
+        self.refresh_cost_centers()
+        self.refresh_cost_report()
+        messagebox.showinfo("مراكز التكلفة", result)
+
+    def refresh_cost_centers(self):
+        centers = cost_centers_list()
+        self._fill_tree(self.cost_centers_tree, [
+            (c["id"], c["name"], c["description"] or "", c["created_at"] or "", c["movements"])
+            for c in centers
+        ])
+        names = ["كل المراكز"] + [c["name"] for c in centers]
+        self.cost_report_combo["values"] = names
+        if not self.cost_report_center_var.get() or self.cost_report_center_var.get() not in names:
+            self.cost_report_center_var.set("كل المراكز")
+
+    def _selected_cost_center_id(self):
+        name = self.cost_report_center_var.get().strip()
+        if not name or name == "كل المراكز":
+            return None
+        for c in cost_centers_list():
+            if c["name"] == name:
+                return c["id"]
+        return None
+
+    def refresh_cost_report(self):
+        data = cost_center_report(
+            center_id=self._selected_cost_center_id(),
+            date_from=self.cost_from_var.get().strip() or None,
+            date_to=self.cost_to_var.get().strip() or None,
+        )
+        self.current_cost_rows = data["rows"]
+        self.cost_kpis["debit"].config(text=fmt(data["total_debit"]))
+        self.cost_kpis["credit"].config(text=fmt(data["total_credit"]))
+        self.cost_kpis["balance"].config(text=fmt(data["final_balance"]))
+        self._fill_tree(self.cost_report_tree, [
+            (r["entry_date"], r["reference"], r["description"], r["account_name"],
+             fmt(r["debit"]), fmt(r["credit"]), fmt(r["running_balance"]))
+            for r in data["rows"]
+        ])
+
+    def export_cost_report(self):
+        rows = [self.cost_report_tree.item(i, "values") for i in self.cost_report_tree.get_children()]
+        self.export_simple_excel(rows, ["التاريخ", "المرجع", "البيان", "الحساب", "مدين", "دائن", "الرصيد"], "cost_centers_report.xlsx")
+
+    def print_cost_report(self):
+        rows = [self.cost_report_tree.item(i, "values") for i in self.cost_report_tree.get_children()]
+        self.print_rows_pdf(
+            "تقرير حركة مراكز التكلفة",
+            f"المركز: {self.cost_report_center_var.get()}",
+            ["التاريخ", "المرجع", "البيان", "الحساب", "مدين", "دائن", "الرصيد"],
+            rows, "cost_centers_report.pdf", landscape_page=True,
+        )
+
+    # ---------- PDF printing helpers ----------
+    def print_rows_pdf(self, title, subtitle, headers, rows, default_name, landscape_page=False, col_widths=None):
+        if not pdf_lib_available():
+            messagebox.showerror("خطأ", "مكتبات PDF غير مثبتة. نفذ pip install -r requirements.txt")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF", "*.pdf")], initialfile=default_name)
+        if not path:
+            return
+        try:
+            build_table_pdf(path, title, subtitle, headers, rows, col_widths=col_widths, landscape_page=landscape_page)
+        except Exception as e:
+            messagebox.showerror("خطأ", f"تعذر إنشاء ملف PDF:\n{e}")
+            return
+        messagebox.showinfo("تم", "تم إنشاء ملف PDF بنجاح")
+
+    def print_entry_voucher(self):
+        """طباعة القيد المحدد كمستند سند قيد رسمي."""
+        entry_id = self.get_selected_entry_id()
+        if not entry_id:
+            messagebox.showwarning("تنبيه", "اختر قيداً أولاً من دفتر اليومية")
+            return
+        if not pdf_lib_available():
+            messagebox.showerror("خطأ", "مكتبات PDF غير مثبتة. نفذ pip install -r requirements.txt")
+            return
+        conn = get_connection(); cur = conn.cursor()
+        head = cur.execute(
+            "SELECT id, entry_date, reference, description, total_debit, total_credit FROM journal_entries WHERE id=?",
+            (entry_id,)).fetchone()
+        conn.close()
+        if not head:
+            return
+        lines = get_entry_lines(entry_id)
+        path = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF", "*.pdf")], initialfile=f"voucher_{entry_id}.pdf")
+        if not path:
+            return
+        try:
+            build_voucher_pdf(
+                path,
+                "سند قيد",
+                [
+                    ("رقم السند", f"قيد رقم {entry_id}"),
+                    ("التاريخ", head["entry_date"]),
+                    ("المرجع", head["reference"] or "-"),
+                    ("البيان", head["description"] or "-"),
+                ],
+                [(r["account_name"], fmt(r["debit"]), fmt(r["credit"]), r["line_description"] or "") for r in lines],
+                fmt(head["total_debit"]),
+                fmt(head["total_credit"]),
+            )
+        except Exception as e:
+            messagebox.showerror("خطأ", f"تعذر إنشاء ملف PDF:\n{e}")
+            return
+        messagebox.showinfo("تم", "تم إنشاء سند القيد PDF بنجاح")
+
+    def print_selected_voucher(self):
+        """طباعة أذن الصرف المحدد كمستند رسمي."""
+        sel = self.vouchers_tree.selection()
+        if not sel:
+            messagebox.showwarning("تنبيه", "اختر أذن صرف أولاً من الجدول")
+            return
+        if not pdf_lib_available():
+            messagebox.showerror("خطأ", "مكتبات PDF غير مثبتة. نفذ pip install -r requirements.txt")
+            return
+        vals = self.vouchers_tree.item(sel[0], "values")
+        entry_id = int(vals[0])
+        lines = get_entry_lines(entry_id)
+        total_debit = sum(float(r["debit"] or 0) for r in lines)
+        total_credit = sum(float(r["credit"] or 0) for r in lines)
+        path = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF", "*.pdf")], initialfile=f"payment_voucher_{entry_id}.pdf")
+        if not path:
+            return
+        try:
+            build_voucher_pdf(
+                path,
+                "إذن صرف",
+                [
+                    ("رقم الأذن", f"{entry_id}"),
+                    ("التاريخ", vals[1]),
+                    ("المرجع", vals[2]),
+                    ("البيان", vals[3]),
+                    ("المستفيد", vals[3]),
+                    ("من حساب", vals[4]),
+                    ("إلى حساب", vals[5]),
+                    ("المبلغ", f"{vals[6]}"),
+                ],
+                [(r["account_name"], fmt(r["debit"]), fmt(r["credit"]), r["line_description"] or "") for r in lines],
+                fmt(total_debit),
+                fmt(total_credit),
+            )
+        except Exception as e:
+            messagebox.showerror("خطأ", f"تعذر إنشاء ملف PDF:\n{e}")
+            return
+        messagebox.showinfo("تم", "تم إنشاء إذن الصرف PDF بنجاح")
+
+    def print_journal_pdf(self):
+        rows = [self.journal_tree.item(i, "values") for i in self.journal_tree.get_children()]
+        self.print_rows_pdf(
+            "دفتر اليومية",
+            f"عدد القيود المعروضة: {len(rows)}",
+            ["رقم", "التاريخ", "المرجع", "البيان", "مدين", "دائن"],
+            rows, "journal.pdf", landscape_page=True,
+        )
+
+    def print_rep_journal_pdf(self):
+        rows = [self.rep_journal_tree.item(i, "values") for i in self.rep_journal_tree.get_children()]
+        self.print_rows_pdf(
+            "تقرير يومية مفصل",
+            f"عدد القيود: {len(rows)}",
+            ["رقم", "التاريخ", "المرجع", "البيان", "مدين", "دائن"],
+            rows, "journal_detail.pdf", landscape_page=True,
+        )
+
+    def print_trial_pdf(self):
+        rows = [self.trial_tree.item(i, "values") for i in self.trial_tree.get_children()]
+        self.print_rows_pdf(
+            "ميزان المراجعة",
+            f"عدد الحسابات: {len(rows)}",
+            ["الحساب", "إجمالي مدين", "إجمالي دائن", "رصيد مدين", "رصيد دائن"],
+            rows, "trial_balance.pdf",
+        )
+
+    def print_ledger_pdf(self):
+        account = self.ledger_account_var.get().strip()
+        rows = [self.ledger_tree.item(i, "values") for i in self.ledger_tree.get_children()]
+        self.print_rows_pdf(
+            "كشف حساب (الأستاذ العام)",
+            f"الحساب: {account or '-'} | عدد الحركات: {len(rows)}",
+            ["التاريخ", "المرجع", "البيان", "مدين", "دائن", "الرصيد"],
+            rows, "ledger.pdf",
+        )
+
+    def print_debtor_pdf(self):
+        sel = self.debtors_list.curselection()
+        person = self.debtors_list.get(sel[0]) if sel else "-"
+        rows = [self.debtor_tree.item(i, "values") for i in self.debtor_tree.get_children()]
+        self.print_rows_pdf(
+            "كشف حساب مدين",
+            f"الشخص: {person}",
+            ["التاريخ", "المرجع", "الحساب", "البيان", "مدين", "دائن", "الرصيد"],
+            rows, "debtor_statement.pdf", landscape_page=True,
+        )
+
+    def print_revexp_pdf(self):
+        account = self.revexp_account_var.get().strip() or "كل الحسابات"
+        rows = [self.revexp_tree.item(i, "values") for i in self.revexp_tree.get_children()]
+        self.print_rows_pdf(
+            "حساب الإيرادات والمصروفات",
+            f"الحساب: {account}",
+            ["التاريخ", "المرجع", "الحساب", "البيان", "مدين", "دائن", "الرصيد"],
+            rows, "revexp_statement.pdf", landscape_page=True,
+        )
+
+    def print_payroll_pdf(self):
+        rows = [self.payroll_tree.item(i, "values") for i in self.payroll_tree.get_children()]
+        self.print_rows_pdf(
+            "بيان المرتبات",
+            f"عدد العاملين: {len(rows)}",
+            ["الرقم", "الاسم", "الفترة", "الجملة", "المستقطعات", "الصافي", "قسط السلف", "قسط البنك", "تأمين", "ضريبة"],
+            rows, "payroll.pdf", landscape_page=True,
+        )
+
+    def print_person_pdf(self):
+        person = self.rep_person_var.get().strip()
+        rows = [self.rep_person_tree.item(i, "values") for i in self.rep_person_tree.get_children()]
+        self.print_rows_pdf(
+            "تقرير كشف حساب شخص",
+            f"الشخص: {person or '-'}",
+            ["التاريخ", "المرجع", "الحساب", "البيان", "مدين", "دائن", "الرصيد"],
+            rows, "person_report.pdf", landscape_page=True,
+        )
+
+    def print_account_pdf(self):
+        account = self.rep_account_var.get().strip()
+        rows = [self.rep_account_tree.item(i, "values") for i in self.rep_account_tree.get_children()]
+        self.print_rows_pdf(
+            "تقرير كشف حساب حساب",
+            f"الحساب: {account or '-'}",
+            ["التاريخ", "المرجع", "البيان", "مدين", "دائن", "الرصيد"],
+            rows, "account_report.pdf",
+        )
+
+    def print_pattern_pdf(self, which):
+        if which == "revenues":
+            tree = self.rep_revenues_tree
+            title = "تقرير الإيرادات"
+        else:
+            tree = self.rep_expenses_tree
+            title = "تقرير المصروفات"
+        rows = [tree.item(i, "values") for i in tree.get_children()]
+        self.print_rows_pdf(
+            title,
+            f"عدد الحركات: {len(rows)}",
+            ["التاريخ", "المرجع", "الحساب", "البيان", "مدين", "دائن", "الرصيد"],
+            rows, f"{which}_report.pdf", landscape_page=True,
+        )
 
     # ---------- refresh methods ----------
 
@@ -1241,6 +1527,8 @@ def export_settlement(self, bank_key):
         self.refresh_vouchers()
         self.refresh_revexp()
         self.refresh_rev_summary()
+        self.refresh_cost_centers()
+        self.refresh_cost_report()
         self.refresh_settlement("bank_misr")
         self.refresh_settlement("idb")
         self.refresh_payroll()
@@ -1290,7 +1578,7 @@ def export_settlement(self, bank_key):
             return
         rows = get_entry_lines(entry_id)
         self._fill_tree(self.entry_lines_tree, [
-            (r["account_name"], fmt(r["debit"]), fmt(r["credit"]), r["line_description"])
+            (r["account_name"], fmt(r["debit"]), fmt(r["credit"]), r["line_description"] or "", r["cost_center"] or "")
             for r in rows
         ])
 

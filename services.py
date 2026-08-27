@@ -198,11 +198,13 @@ def get_entry_lines(entry_id):
     conn = get_connection()
     cur = conn.cursor()
     rows = cur.execute("""
-        SELECT a.name AS account_name, jl.debit, jl.credit
+        SELECT a.name AS account_name, jl.debit, jl.credit, jl.line_description,
+               cc.name AS cost_center
         FROM journal_lines jl
         JOIN accounts a ON a.id = jl.account_id
+        LEFT JOIN cost_centers cc ON cc.id = jl.cost_center_id
         WHERE jl.entry_id = ?
-        ORDER BY a.name
+        ORDER BY jl.id
     """, (entry_id,)).fetchall()
     conn.close()
     return [dict(x) for x in rows]
@@ -702,3 +704,124 @@ def post_bank_settlement_adjustment(bank_key, settlement_year=None):
     conn.close()
     return f"تم ترحيل قيد التسوية بمبلغ {amount:,.2f}"
 
+
+# ---------- مراكز التكلفة ----------
+
+def cost_centers_list():
+    """قائمة مراكز التكلفة مع عدد الحركات المرتبطة بكل مركز."""
+    conn = get_connection()
+    cur = conn.cursor()
+    rows = cur.execute("""
+        SELECT cc.id, cc.name, cc.description, cc.created_at,
+               (SELECT COUNT(*) FROM journal_lines jl WHERE jl.cost_center_id = cc.id) AS movements
+        FROM cost_centers cc
+        ORDER BY cc.name
+    """).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def add_cost_center(name, description=""):
+    """إضافة مركز تكلفة جديد. يعيد رسالة نجاح أو خطأ."""
+    name = (name or "").strip()
+    if not name:
+        return "أدخل اسم المركز أولاً"
+    conn = get_connection()
+    cur = conn.cursor()
+    exists = cur.execute("SELECT id FROM cost_centers WHERE name = ?", (name,)).fetchone()
+    if exists:
+        conn.close()
+        return f"المركز '{name}' موجود مسبقاً"
+    now = __import__("datetime").datetime.now().isoformat(timespec="seconds")
+    cur.execute("INSERT INTO cost_centers(name, description, created_at) VALUES (?, ?, ?)",
+                (name, (description or "").strip(), now))
+    conn.commit()
+    conn.close()
+    return f"تمت إضافة مركز التكلفة '{name}'"
+
+
+def rename_cost_center(center_id, name):
+    name = (name or "").strip()
+    if not name:
+        return "أدخل الاسم الجديد"
+    conn = get_connection()
+    cur = conn.cursor()
+    exists = cur.execute("SELECT id FROM cost_centers WHERE name = ? AND id != ?", (name, center_id)).fetchone()
+    if exists:
+        conn.close()
+        return f"المركز '{name}' موجود مسبقاً"
+    cur.execute("UPDATE cost_centers SET name = ? WHERE id = ?", (name, center_id))
+    conn.commit()
+    conn.close()
+    return "تمت إعادة التسمية"
+
+
+def delete_cost_center(center_id):
+    """حذف مركز تكلفة وفك ارتباطه من كل القيود."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE journal_lines SET cost_center_id = NULL WHERE cost_center_id = ?", (center_id,))
+    cur.execute("DELETE FROM cost_centers WHERE id = ?", (center_id,))
+    conn.commit()
+    conn.close()
+    return "تم حذف المركز وفك ارتباطه من القيود"
+
+
+def cost_center_report(center_id=None, date_from=None, date_to=None):
+    """
+    تقرير حركة مراكز التكلفة:
+    كل سطور القيود المرتبطة بالمركز (أو كل المراكز) مع الرصيد التراكمي.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    where = ["jl.cost_center_id IS NOT NULL"]
+    params = []
+    if center_id:
+        where.append("jl.cost_center_id = ?")
+        params.append(center_id)
+    if date_from:
+        where.append("je.entry_date >= ?")
+        params.append(date_from)
+    if date_to:
+        where.append("je.entry_date <= ?")
+        params.append(date_to)
+    where_sql = " AND ".join(where)
+
+    rows = cur.execute(f"""
+        SELECT je.entry_date, je.reference, je.description, a.name AS account_name,
+               jl.debit, jl.credit, cc.name AS cost_center
+        FROM journal_lines jl
+        JOIN journal_entries je ON je.id = jl.entry_id
+        JOIN accounts a ON a.id = jl.account_id
+        JOIN cost_centers cc ON cc.id = jl.cost_center_id
+        WHERE {where_sql}
+        ORDER BY je.entry_date, je.id, jl.id
+    """, params).fetchall()
+
+    result = []
+    running = 0.0
+    total_debit = 0.0
+    total_credit = 0.0
+    for r in rows:
+        debit = float(r["debit"] or 0)
+        credit = float(r["credit"] or 0)
+        running += debit - credit
+        total_debit += debit
+        total_credit += credit
+        result.append({
+            "entry_date": r["entry_date"],
+            "reference": r["reference"],
+            "description": r["description"],
+            "account_name": r["account_name"],
+            "debit": debit,
+            "credit": credit,
+            "cost_center": r["cost_center"],
+            "running_balance": running,
+        })
+    conn.close()
+    return {
+        "rows": result,
+        "total_debit": total_debit,
+        "total_credit": total_credit,
+        "final_balance": running,
+    }
