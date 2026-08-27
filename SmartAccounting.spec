@@ -1,12 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 # spec للبناء كملف EXE واحد (onefile)
-import os
+# قاعدة البيانات (accounting.db) تُنشأ تلقائياً بجوار ملف التنفيذ أول تشغيل، لذا لا تُضمَّن هنا.
 
-# أضف الملفات المساعدة الموجودة فقط (قاعدة البيانات والملفات النموذجية)
-datas = []
-for f in ["accounting.db", "sample_import.xlsx", "sample_payroll.xlsx"]:
-    if os.path.exists(f):
-        datas.append((f, "."))
+datas = [("sample_import.xlsx", "."), ("sample_payroll.xlsx", ".")]
 
 a = Analysis(
     ['main.py'],

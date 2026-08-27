@@ -1,11 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
-# spec للبناء كمجلد تطبيق (onedir) - الأكثر استقراراً على Windows
-import os
+# spec للبناء كتطبيق مجلد (onedir)
 
-datas = []
-for f in ["accounting.db", "sample_import.xlsx", "sample_payroll.xlsx"]:
-    if os.path.exists(f):
-        datas.append((f, "."))
+datas = [("sample_import.xlsx", "."), ("sample_payroll.xlsx", ".")]
 
 a = Analysis(
     ['main.py'],
@@ -44,7 +40,6 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
-
 coll = COLLECT(
     exe,
     a.binaries,

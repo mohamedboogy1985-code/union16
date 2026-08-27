@@ -856,7 +856,7 @@ class AccountingApp(tk.Tk):
         self.refresh_settlement_preview(bank_key)
 
         if report.get("account_found"):
-            account_report = account_statement_report(report.get("bank_name"))
+            account_report = account_statement_report([report.get("bank_name")])
             rows = [
                 (r["entry_date"], r["reference"], r["description"], fmt(r["debit"]), fmt(r["credit"]))
                 for r in account_report.get("rows", [])[-200:]

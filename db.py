@@ -1,8 +1,14 @@
 
 import os
 import sqlite3
+import sys
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# عند التشغيل كتطبيق PyInstaller (onefile/onedir) يضع sys.frozen الملفات في مجلد مؤقت (_MEIPASS)
+# لذلك نخزن قاعدة البيانات بجوار ملف التنفيذ حتى لا تُفقد البيانات عند إغلاق البرنامج.
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "accounting.db")
 
 def get_connection():

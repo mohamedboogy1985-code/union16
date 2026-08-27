@@ -1,8 +1,22 @@
 
 import os
+import re
 from datetime import datetime
 from openpyxl import load_workbook
 from db import init_db, get_connection
+
+
+def _norm_ar(text):
+    """توحيد أشكال الإملاء العربي لتقارن الترويسات والعناوين بشكل موثوق."""
+    text = str(text or "").replace("ـ", "")
+    text = re.sub(r"\s+", "", text)
+    text = (text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+                .replace("ى", "ي").replace("ة", "ه"))
+    return text
+
+
+def _is_total_label(text):
+    return "الاجمال" in _norm_ar(text)
 
 def guess_category(account_name: str) -> str:
     name = account_name.strip()
@@ -49,16 +63,31 @@ def import_excel_file(file_path: str) -> str:
     wb = load_workbook(file_path, data_only=False)
     ws = wb[wb.sheetnames[0]]
 
-    account_pairs = []
-    seen = {}
+    # 1) كشف خانتي الإجمالى من الترويسة ثم تجميع أزواج أعمدة الحسابات (مدين/دائن)
+    totals = None
+    candidates = []
     for col in range(4, ws.max_column + 1, 2):
         raw_name = _clean_name(ws.cell(2, col).value)
-        if not raw_name or raw_name == "الإجمالى":
+        if _is_total_label(raw_name):
+            if totals is None:
+                totals = (col, col + 1)
+            continue
+        if raw_name:
+            candidates.append((raw_name, col, col + 1))
+
+    # عمودا الإجمالى وفق تخطيط اليومية الأمريكية هما 4 و 5 عادة.
+    if totals is None:
+        totals = (4, 5)
+
+    account_pairs = []
+    seen = {}
+    for raw_name, debit_col, credit_col in candidates:
+        if debit_col in totals or credit_col in totals:
             continue
         count = seen.get(raw_name, 0) + 1
         seen[raw_name] = count
         final_name = raw_name if count == 1 else f"{raw_name} ({count})"
-        account_pairs.append((final_name, col, col + 1))
+        account_pairs.append((final_name, debit_col, credit_col))
 
     conn = get_connection()
     cur = conn.cursor()
@@ -87,10 +116,10 @@ def import_excel_file(file_path: str) -> str:
         date_value = ws.cell(row, 1).value
         description = _clean_name(ws.cell(row, 3).value)
         reference = _clean_name(ws.cell(row, 2).value)
-        total_debit = _num(ws.cell(row, 4).value)
-        total_credit = _num(ws.cell(row, 5).value)
+        total_debit = _num(ws.cell(row, totals[0]).value)
+        total_credit = _num(ws.cell(row, totals[1]).value)
 
-        if str(date_value).strip() == "الإجمـــالى":
+        if _is_total_label(date_value):
             break
         if not date_value and not description:
             continue
