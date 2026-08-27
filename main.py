@@ -2,6 +2,7 @@
 import os
 import shutil
 import sqlite3
+import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
@@ -31,6 +32,23 @@ from pdf_reports import (
     build_voucher_pdf,
     build_settlement_pdf,
 )
+from auth import (
+    authenticate,
+    has_permission,
+    users_list,
+    add_user,
+    update_user,
+    delete_user,
+    ROLE_ADMIN,
+    ROLE_ACCOUNTANT,
+    ROLE_VIEWER,
+    ROLE_LABELS,
+    PERM_IMPORT,
+    PERM_EDIT_ENTRIES,
+    PERM_SETTLEMENTS,
+    PERM_EXPORT,
+    PERM_USERS,
+)
 from services import (
     dashboard_summary,
     list_entries,
@@ -58,6 +76,8 @@ from services import (
     rename_cost_center,
     delete_cost_center,
     cost_center_report,
+    monthly_summary,
+    available_years,
 )
 
 
@@ -282,8 +302,9 @@ class EntryEditor(tk.Toplevel):
 
 
 class AccountingApp(tk.Tk):
-    def __init__(self):
+    def __init__(self, current_user=None):
         super().__init__()
+        self.current_user = current_user
         self.title(APP_TITLE)
         self.geometry("1450x900")
         self.minsize(1200, 760)
@@ -291,6 +312,7 @@ class AccountingApp(tk.Tk):
         self._style()
         self._header()
         self._build_ui()
+        self._apply_permissions()
         self.refresh_all()
 
     def _style(self):
@@ -312,6 +334,10 @@ class AccountingApp(tk.Tk):
         top.pack(fill="x")
         top.pack_propagate(False)
         ttk.Label(top, text="نظام محاسبي مكتبي متكامل", style="Header.TLabel").pack(side="right", padx=16, pady=12)
+        user = self.current_user or {}
+        user_info = f"{user.get('full_name') or user.get('username') or 'مستخدم'} ({user.get('role_label') or '-'})"
+        ttk.Label(top, text=user_info, style="Header.TLabel", font=("Tahoma", 10)).pack(side="left", padx=16)
+        ttk.Button(top, text="تسجيل الخروج", command=self.logout).pack(side="left", padx=4)
         btns = tk.Frame(top, bg="#0f4c81")
         btns.pack(side="left", padx=16)
         for txt, cmd in [
@@ -321,6 +347,26 @@ class AccountingApp(tk.Tk):
             ("نسخة احتياطية", self.backup_db),
         ]:
             ttk.Button(btns, text=txt, command=cmd).pack(side="left", padx=4)
+        # حفظ مرجع أزرار الهيدر لتقييدها حسب الصلاحية
+        self.header_buttons = {
+            "import_journal": self._find_header_button(btns, "استيراد اليومية"),
+            "import_payroll": self._find_header_button(btns, "استيراد المرتبات"),
+            "backup": self._find_header_button(btns, "نسخة احتياطية"),
+        }
+
+    @staticmethod
+    def _find_header_button(parent, text):
+        for child in parent.winfo_children():
+            try:
+                if str(child.cget("text")) == text:
+                    return child
+            except Exception:
+                continue
+        return None
+
+    def logout(self):
+        if messagebox.askyesno("تسجيل الخروج", "هل تريد تسجيل الخروج؟"):
+            self.destroy()
 
     def _build_ui(self):
         self.nb = ttk.Notebook(self)
@@ -657,6 +703,7 @@ class AccountingApp(tk.Tk):
         box.pack(fill="x", padx=10, pady=4)
         self.rev_status = ttk.Label(box, text="الحالة: -", style="Section.TLabel")
         self.rev_status.pack(anchor="e")
+        ttk.Button(box, text="طباعة PDF", command=self.print_rev_summary_pdf).pack(anchor="w", padx=10)
         tf, self.revsum_tree = self._tree(sumf, ("account", "type", "debit", "credit", "balance"),
                                           ("الحساب", "النوع", "مدين", "دائن", "الرصيد الطبيعي"),
                                           (420, 120, 120, 120, 120))
@@ -675,9 +722,15 @@ class AccountingApp(tk.Tk):
         ttk.Entry(top, textvariable=self.cost_name_var, width=26).pack(side="right", padx=4)
         ttk.Label(top, text="الوصف").pack(side="right", padx=4)
         ttk.Entry(top, textvariable=self.cost_desc_var, width=34).pack(side="right", padx=4)
-        ttk.Button(top, text="إضافة", command=self.add_cost_center).pack(side="left", padx=4)
-        ttk.Button(top, text="إعادة تسمية المحدد", command=self.rename_cost_center).pack(side="left", padx=4)
-        ttk.Button(top, text="حذف المحدد", command=self.delete_cost_center).pack(side="left", padx=4)
+        self.cost_admin_buttons = []
+        for txt, cmd in [
+            ("إضافة", self.add_cost_center),
+            ("إعادة تسمية المحدد", self.rename_cost_center),
+            ("حذف المحدد", self.delete_cost_center),
+        ]:
+            btn = ttk.Button(top, text=txt, command=cmd)
+            btn.pack(side="left", padx=4)
+            self.cost_admin_buttons.append(btn)
         ttk.Button(top, text="تحديث", command=self.refresh_cost_centers).pack(side="left", padx=4)
         ttk.Label(mgmt, text="لتوزيع الحركات على المراكز: افتح القيد من دفتر اليومية ثم اختر المركز لكل سطر قبل الحفظ.",
                   style="Section.TLabel").pack(anchor="e", padx=10, pady=4)
@@ -720,8 +773,16 @@ class AccountingApp(tk.Tk):
         top = ttk.Frame(f)
         top.pack(fill="x", padx=10, pady=8)
         ttk.Button(top, text="تحديث", command=lambda k=bank_key: self.refresh_settlement(k)).pack(side="left", padx=4)
-        ttk.Button(top, text="حفظ التسوية", command=lambda k=bank_key: self.save_settlement(k)).pack(side="left", padx=4)
-        ttk.Button(top, text="ترحيل الفروقات", command=lambda k=bank_key: self.post_settlement(k)).pack(side="left", padx=4)
+        self.settlement_admin_buttons = getattr(self, "settlement_admin_buttons", {})
+        btns = {}
+        for txt, cmd in [
+            ("حفظ التسوية", lambda k=bank_key: self.save_settlement(k)),
+            ("ترحيل الفروقات", lambda k=bank_key: self.post_settlement(k)),
+        ]:
+            btn = ttk.Button(top, text=txt, command=cmd)
+            btn.pack(side="left", padx=4)
+            btns[txt] = btn
+        self.settlement_admin_buttons[bank_key] = btns
         ttk.Button(top, text="تصدير Excel", command=lambda k=bank_key: self.export_settlement(k)).pack(side="left", padx=4)
         ttk.Button(top, text="طباعة PDF", command=lambda k=bank_key: self.export_settlement_pdf(k)).pack(side="left", padx=4)
 
@@ -1082,6 +1143,24 @@ class AccountingApp(tk.Tk):
         self.trial_summary_label = ttk.Label(ts, text="الإجماليات: -", style="Section.TLabel")
         self.trial_summary_label.pack(anchor="e", padx=10, pady=10)
 
+        msum = self._screen(nb, "الملخص الشهري (فائض / عجز)")
+        top = ttk.Frame(msum); top.pack(fill="x", padx=10, pady=8)
+        self.monthly_year_var = tk.StringVar()
+        self.monthly_year_combo = ttk.Combobox(top, textvariable=self.monthly_year_var, width=10, state="readonly")
+        self.monthly_year_combo.pack(side="right", padx=4)
+        self.monthly_year_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_monthly())
+        ttk.Label(top, text="السنة").pack(side="right", padx=4)
+        ttk.Button(top, text="تحديث", command=self.refresh_monthly).pack(side="left", padx=4)
+        ttk.Button(top, text="تصدير Excel", command=self.export_monthly).pack(side="left", padx=4)
+        ttk.Button(top, text="طباعة PDF", command=self.print_monthly).pack(side="left", padx=4)
+        self.monthly_kpis = self._kpi_row(msum)
+        self.monthly_status = ttk.Label(msum, text="", style="Section.TLabel")
+        self.monthly_status.pack(anchor="e", padx=10)
+        tf, self.monthly_tree = self._tree(msum, ("month", "revenues", "expenses", "net"),
+                                           ("الشهر", "الإيرادات", "المصروفات", "صافي الفائض / العجز"),
+                                           (260, 160, 160, 200))
+        tf.pack(fill="both", expand=True, padx=10, pady=8)
+
     def _build_settings(self):
         nb = self._subnb(self.tabs["settings"])
 
@@ -1109,6 +1188,44 @@ class AccountingApp(tk.Tk):
         ttk.Label(restore, text="استرجاع نسخة قاعدة البيانات", style="Section.TLabel").pack(anchor="e", padx=10, pady=10)
         ttk.Button(restore, text="استرجاع قاعدة بيانات", command=self.restore_db).pack(anchor="e", padx=10)
 
+        if has_permission(self.current_user, PERM_USERS):
+            users_screen = self._screen(nb, "إدارة المستخدمين")
+            ttk.Label(users_screen, text="إدارة مستخدمي النظام والصلاحيات", style="Section.TLabel").pack(anchor="e", padx=10, pady=10)
+
+            add_box = ttk.LabelFrame(users_screen, text="إضافة مستخدم جديد")
+            add_box.pack(fill="x", padx=10, pady=6)
+            frm = ttk.Frame(add_box); frm.pack(fill="x", padx=10, pady=8)
+            self.user_username_var = tk.StringVar()
+            self.user_password_var = tk.StringVar()
+            self.user_fullname_var = tk.StringVar()
+            self.user_role_var = tk.StringVar(value=ROLE_VIEWER)
+            ttk.Label(frm, text="اسم المستخدم").pack(side="right", padx=4)
+            ttk.Entry(frm, textvariable=self.user_username_var, width=18).pack(side="right", padx=4)
+            ttk.Label(frm, text="كلمة المرور").pack(side="right", padx=4)
+            ttk.Entry(frm, textvariable=self.user_password_var, width=16).pack(side="right", padx=4)
+            ttk.Label(frm, text="الاسم الكامل").pack(side="right", padx=4)
+            ttk.Entry(frm, textvariable=self.user_fullname_var, width=22).pack(side="right", padx=4)
+            ttk.Label(frm, text="الصلاحية").pack(side="right", padx=4)
+            ttk.Combobox(frm, textvariable=self.user_role_var, values=list(ROLE_LABELS.values()), width=14, state="readonly").pack(side="right", padx=4)
+            ttk.Button(frm, text="إضافة المستخدم", command=self.add_user_action).pack(side="left", padx=6)
+
+            edit_box = ttk.LabelFrame(users_screen, text="تعديل مستخدم موجود")
+            edit_box.pack(fill="x", padx=10, pady=6)
+            frm2 = ttk.Frame(edit_box); frm2.pack(fill="x", padx=10, pady=8)
+            self.user_new_password_var = tk.StringVar()
+            ttk.Label(frm2, text="كلمة مرور جديدة (اتركها فارغة للإبقاء)").pack(side="right", padx=4)
+            pent = ttk.Entry(frm2, textvariable=self.user_new_password_var, width=16, show="*")
+            pent.pack(side="right", padx=4)
+            ttk.Button(frm2, text="حفظ التعديلات", command=self.update_selected_user).pack(side="left", padx=6)
+            ttk.Button(frm2, text="تعطيل/تفعيل", command=self.toggle_selected_user).pack(side="left", padx=6)
+            ttk.Button(frm2, text="حذف المستخدم", command=self.delete_selected_user).pack(side="left", padx=6)
+
+            tf, self.users_tree = self._tree(users_screen, ("id", "username", "full_name", "role", "status"),
+                                             ("رقم", "اسم المستخدم", "الاسم الكامل", "الصلاحية", "الحالة"),
+                                             (70, 160, 220, 180, 100))
+            tf.pack(fill="both", expand=True, padx=10, pady=8)
+            self.users_tree.bind("<<TreeviewSelect>>", lambda e: self.load_selected_user())
+
         sysf = self._screen(nb, "إعدادات النظام")
         txt = (
             "إعدادات النظام الحالية:\n"
@@ -1122,6 +1239,131 @@ class AccountingApp(tk.Tk):
             "- يمكن تطوير الصلاحيات ومتعدد المستخدمين لاحقاً"
         )
         ttk.Label(sysf, text=txt, justify="right").pack(anchor="e", padx=10, pady=10)
+
+    # ---------- users actions ----------
+    def role_key_to_label(self, role):
+        return ROLE_LABELS.get(role, role)
+
+    def role_label_to_key(self, label):
+        for key, lbl in ROLE_LABELS.items():
+            if lbl == label:
+                return key
+        return ROLE_VIEWER
+
+    def load_selected_user(self):
+        sel = self.users_tree.selection()
+        if not sel:
+            return
+        vals = self.users_tree.item(sel[0], "values")
+        self.user_username_var.set(vals[1] if len(vals) > 1 else "")
+
+    def refresh_users(self):
+        self._fill_tree(self.users_tree, [
+            (u["id"], u["username"], u["full_name"] or "", self.role_key_to_label(u["role"]),
+             "مفعل" if u["active"] else "معطل")
+            for u in users_list()
+        ])
+
+    def add_user_action(self):
+        role = self.role_label_to_key(self.user_role_var.get())
+        result = add_user(self.user_username_var.get(), self.user_password_var.get(),
+                          self.user_fullname_var.get(), role)
+        self.refresh_users()
+        messagebox.showinfo("المستخدمين", result)
+
+    def get_selected_user_id(self):
+        sel = self.users_tree.selection()
+        if not sel:
+            return None
+        return int(self.users_tree.item(sel[0], "values")[0])
+
+    def update_selected_user(self):
+        user_id = self.get_selected_user_id()
+        if not user_id:
+            messagebox.showwarning("تنبيه", "اختر مستخدماً من الجدول أولاً")
+            return
+        vals = [self.users_tree.item(s, "values") for s in self.users_tree.selection()][0]
+        role = self.role_label_to_key(vals[3])
+        full_name = self.user_fullname_var.get() if self.user_fullname_var.get() else vals[2]
+        password = self.user_new_password_var.get()
+        result = update_user(user_id, full_name=full_name, role=role, password=password or None)
+        self.user_new_password_var.set("")
+        self.refresh_users()
+        messagebox.showinfo("المستخدمين", result)
+
+    def toggle_selected_user(self):
+        user_id = self.get_selected_user_id()
+        if not user_id:
+            messagebox.showwarning("تنبيه", "اختر مستخدماً من الجدول أولاً")
+            return
+        vals = [self.users_tree.item(s, "values") for s in self.users_tree.selection()][0]
+        current = 0 if vals[4] == "مفعل" else 1
+        update_user(user_id, active=bool(current))
+        self.refresh_users()
+
+    def delete_selected_user(self):
+        user_id = self.get_selected_user_id()
+        if not user_id:
+            messagebox.showwarning("تنبيه", "اختر مستخدماً من الجدول أولاً")
+            return
+        if not messagebox.askyesno("تأكيد", "هل تريد حذف المستخدم المحدد؟"):
+            return
+        current_id = (self.current_user or {}).get("id")
+        result = delete_user(user_id, current_id)
+        self.refresh_users()
+        messagebox.showinfo("المستخدمين", result)
+
+    # ---------- permissions ----------
+    def _apply_permissions(self):
+        user = self.current_user
+        if not user or user.get("role") == ROLE_ADMIN:
+            return
+
+        disabled_texts = []
+        if not has_permission(user, PERM_IMPORT):
+            disabled_texts += ["استيراد اليومية", "استيراد المرتبات", "استيراد ملف المرتبات",
+                               "اختيار ملف واستيراد"]
+        if not has_permission(user, PERM_EDIT_ENTRIES):
+            disabled_texts += ["إضافة قيد", "تعديل القيد المحدد", "حذف القيد المحدد",
+                               "فتح شاشة الإضافة", "إضافة قيد جديد"]
+        if not has_permission(user, PERM_SETTLEMENTS):
+            disabled_texts += ["حفظ التسوية", "ترحيل الفروقات"]
+        if not has_permission(user, PERM_EXPORT):
+            disabled_texts += ["تصدير", "طباعة"]
+        if user.get("role") == ROLE_VIEWER:
+            disabled_texts += ["نسخة احتياطية", "استرجاع"]
+
+        # تعطيل أزرار مراكز التكلفة الإدارية
+        if not has_permission(user, PERM_EDIT_ENTRIES):
+            for btn in getattr(self, "cost_admin_buttons", []):
+                try:
+                    btn.state(["disabled"])
+                except Exception:
+                    pass
+
+        # تعطيل أزرار التسوية الإدارية
+        for bank_key, btns in getattr(self, "settlement_admin_buttons", {}).items():
+            for btn in btns.values():
+                try:
+                    btn.state(["disabled"])
+                except Exception:
+                    pass
+
+        # تعطيل عام: كل الأزرار التي يطابق نصها قائمة الممنوعات
+        def walk(widget):
+            for child in widget.winfo_children():
+                try:
+                    text = str(child.cget("text"))
+                    if any(block in text for block in disabled_texts):
+                        try:
+                            child.state(["disabled"])
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                walk(child)
+
+        walk(self)
 
     # ---------- cost centers actions ----------
     def load_selected_cost_center(self):
@@ -1405,6 +1647,52 @@ class AccountingApp(tk.Tk):
             rows, f"{which}_report.pdf", landscape_page=True,
         )
 
+    # ---------- monthly summary ----------
+    def refresh_monthly(self):
+        years = available_years()
+        self.monthly_year_combo["values"] = years
+        current = self.monthly_year_var.get().strip()
+        if current not in years:
+            current = years[0] if years else str(datetime.today().year)
+            self.monthly_year_var.set(current)
+        data = monthly_summary(current or None)
+        self.current_monthly = data
+        self.monthly_kpis["debit"].config(text=fmt(data["total_revenues"]))
+        self.monthly_kpis["credit"].config(text=fmt(data["total_expenses"]))
+        self.monthly_kpis["balance"].config(text=fmt(data["net_result"]))
+        state = "فائض" if data["net_result"] >= 0 else "عجز"
+        self.monthly_status.config(
+            text=f"سنة {data['year']} | الإيرادات: {fmt(data['total_revenues'])} | المصروفات: {fmt(data['total_expenses'])} | النتيجة: {fmt(data['net_result'])} ({state})"
+        )
+        self._fill_tree(self.monthly_tree, [
+            (m["month_name"], fmt(m["revenues"]), fmt(m["expenses"]), fmt(m["net"]))
+            for m in data["rows"]
+        ])
+
+    def export_monthly(self):
+        rows = [self.monthly_tree.item(i, "values") for i in self.monthly_tree.get_children()]
+        self.export_simple_excel(rows, ["الشهر", "الإيرادات", "المصروفات", "صافي الفائض / العجز"], "monthly_summary.xlsx")
+
+    def print_monthly(self):
+        rows = [self.monthly_tree.item(i, "values") for i in self.monthly_tree.get_children()]
+        year = self.monthly_year_var.get().strip()
+        self.print_rows_pdf(
+            "الملخص الشهري للفائض / العجز",
+            f"سنة {year or '-'}",
+            ["الشهر", "الإيرادات", "المصروفات", "صافي الفائض / العجز"],
+            rows, "monthly_summary.pdf",
+        )
+
+    def print_rev_summary_pdf(self):
+        """طباعة ملخص الفائض / العجز النهائي من شاشة الإيرادات والمصروفات."""
+        rows = [self.revsum_tree.item(i, "values") for i in self.revsum_tree.get_children()]
+        self.print_rows_pdf(
+            "ملخص الفائض / العجز النهائي",
+            "إيرادات ومصروفات حسب الحساب",
+            ["الحساب", "النوع", "مدين", "دائن", "الرصيد الطبيعي"],
+            rows, "surplus_deficit_summary.pdf",
+        )
+
     # ---------- refresh methods ----------
 
 def _safe_float(self, value):
@@ -1537,6 +1825,9 @@ def export_settlement(self, bank_key):
         self.refresh_pattern_report("revenues")
         self.refresh_pattern_report("expenses")
         self.refresh_people_names()
+        self.refresh_monthly()
+        if hasattr(self, "users_tree"):
+            self.refresh_users()
 
     def refresh_dashboard(self):
         data = dashboard_summary()
@@ -1828,6 +2119,76 @@ def export_settlement(self, bank_key):
         self.export_simple_excel(rows, ["التاريخ", "المرجع", "البيان", "مدين", "دائن", "الرصيد"], "account_report.xlsx")
 
 
+class LoginDialog(tk.Toplevel):
+    """نافذة تسجيل الدخول التي تظهر قبل فتح النظام."""
+    def __init__(self, master):
+        super().__init__(master)
+        self.master = master
+        self.result = None
+        self.title("تسجيل الدخول - النظام المحاسبي")
+        self.geometry("420x260")
+        self.resizable(False, False)
+        self.transient(master)
+        self.grab_set()
+
+        box = ttk.Frame(self)
+        box.pack(fill="both", expand=True, padx=24, pady=20)
+
+        ttk.Label(box, text="النظام المحاسبي المكتبي المتكامل", style="Section.TLabel").pack(pady=(0, 4))
+        ttk.Label(box, text="يرجى تسجيل الدخول للمتابعة").pack(pady=(0, 14))
+
+        ttk.Label(box, text="اسم المستخدم").pack(anchor="e")
+        self.username_var = tk.StringVar()
+        ent = ttk.Entry(box, textvariable=self.username_var, width=32)
+        ent.pack(fill="x", pady=(2, 8))
+        ent.focus_set()
+
+        ttk.Label(box, text="كلمة المرور").pack(anchor="e")
+        self.password_var = tk.StringVar()
+        pent = ttk.Entry(box, textvariable=self.password_var, width=32, show="•")
+        pent.pack(fill="x", pady=(2, 12))
+
+        ttk.Label(box, text="المستخدم الافتراضي عند أول تشغيل: admin / admin", foreground="#777").pack(pady=(0, 8))
+
+        btns = ttk.Frame(box)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="دخول", command=self.submit).pack(side="left", padx=4)
+        ttk.Button(btns, text="خروج", command=self.cancel).pack(side="left", padx=4)
+
+        self.error = ttk.Label(box, text="", foreground="red")
+        self.error.pack(pady=(6, 0))
+
+        self.bind("<Return>", lambda e: self.submit())
+        self.bind("<Escape>", lambda e: self.cancel())
+        self.protocol("WM_DELETE_WINDOW", self.cancel)
+
+    def submit(self):
+        user = authenticate(self.username_var.get(), self.password_var.get())
+        if user:
+            self.result = user
+            self.destroy()
+        else:
+            self.error.config(text="اسم المستخدم أو كلمة المرور غير صحيحة")
+
+    def cancel(self):
+        self.result = None
+        self.destroy()
+
+
+def show_login():
+    """يعرض نافذة الدخول ويعيد بيانات المستخدم أو None عند الخروج."""
+    root = tk.Tk()
+    root.withdraw()
+    dialog = LoginDialog(root)
+    root.wait_window(dialog)
+    user = dialog.result
+    root.destroy()
+    return user
+
+
 if __name__ == "__main__":
-    app = AccountingApp()
+    current_user = show_login()
+    if current_user is None:
+        sys.exit(0)
+    app = AccountingApp(current_user)
     app.mainloop()

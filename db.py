@@ -111,6 +111,16 @@ def init_db():
     )""")
 
     cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        full_name TEXT,
+        role TEXT DEFAULT 'viewer',
+        active INTEGER DEFAULT 1
+    )""")
+
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS bank_settlements (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         bank_key TEXT NOT NULL,
