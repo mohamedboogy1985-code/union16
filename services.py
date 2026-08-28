@@ -825,3 +825,123 @@ def cost_center_report(center_id=None, date_from=None, date_to=None):
         "total_credit": total_credit,
         "final_balance": running,
     }
+
+# ---------- التقارير الشهرية (فائض / عجز) ----------
+
+def monthly_summary(year=None):
+    """
+    ملخص شهري للإيرادات والمصروفات وصافي الفائض/العجز.
+    year: السنة (أو None لأحدث سنة في البيانات). يعيد أيضاً قائمة الأشهر المتاحة.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+
+    # تحديد السنة (أحدث سنة صحيحة في البيانات)
+    if year is None:
+        row = cur.execute("""
+            SELECT MAX(SUBSTR(entry_date,1,4)) AS y
+            FROM journal_entries
+            WHERE SUBSTR(entry_date,1,4) GLOB '[0-9][0-9][0-9][0-9]'
+        """).fetchone()
+        year = row["y"] if row and row["y"] else str(datetime.today().year)
+    year = str(year)
+
+    # الأشهر المتاحة في هذه السنة (حتى لو بلا حركة إيرادات/مصروفات)
+    months = [dict(r) for r in cur.execute("""
+        SELECT DISTINCT SUBSTR(entry_date, 1, 7) AS ym
+        FROM journal_entries
+        WHERE SUBSTR(entry_date, 1, 4) = ?
+        ORDER BY ym
+    """, (year,)).fetchall()]
+
+    # تجميع الإيرادات والمصروفات شهرياً
+    rows = cur.execute("""
+        SELECT SUBSTR(je.entry_date, 1, 7) AS ym,
+               a.name AS account_name,
+               SUM(jl.debit) AS debit,
+               SUM(jl.credit) AS credit
+        FROM journal_lines jl
+        JOIN journal_entries je ON je.id = jl.entry_id
+        JOIN accounts a ON a.id = jl.account_id
+        WHERE SUBSTR(je.entry_date, 1, 4) = ?
+          AND (a.name LIKE '%إيراد%' OR a.name LIKE '%ايراد%' OR a.name LIKE '%الإيرادات%'
+               OR a.name LIKE '%مصروف%' OR a.name LIKE '%نفقة%')
+        GROUP BY ym, a.name
+        ORDER BY ym, a.name
+    """, (year,)).fetchall()
+
+    month_names = ["يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو",
+                   "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر"]
+
+    monthly = {}
+    for m in months:
+        ym = m["ym"]
+        month_no = int(ym.split("-")[1])
+        monthly[ym] = {
+            "month": month_no,
+            "month_name": f"{month_names[month_no - 1]} {year}",
+            "revenues": 0.0,
+            "expenses": 0.0,
+            "net": 0.0,
+        }
+
+    detail_rows = []
+    for r in rows:
+        ym = r["ym"]
+        name = r["account_name"]
+        debit = float(r["debit"] or 0)
+        credit = float(r["credit"] or 0)
+        is_expense = ("مصروف" in name) or ("نفقة" in name)
+        natural = (debit - credit) if is_expense else (credit - debit)
+        if ym not in monthly:
+            month_no = int(ym.split("-")[1])
+            monthly[ym] = {
+                "month": month_no,
+                "month_name": f"{month_names[month_no - 1]} {year}",
+                "revenues": 0.0,
+                "expenses": 0.0,
+                "net": 0.0,
+            }
+        if is_expense:
+            monthly[ym]["expenses"] += natural
+        else:
+            monthly[ym]["revenues"] += natural
+        detail_rows.append({
+            "ym": ym,
+            "month_name": monthly[ym]["month_name"],
+            "account_name": name,
+            "account_type": "مصروفات" if is_expense else "إيرادات",
+            "amount": natural,
+        })
+
+    for m in monthly.values():
+        m["net"] = m["revenues"] - m["expenses"]
+
+    ordered = sorted(monthly.values(), key=lambda x: x["month"])
+    total_revenues = sum(m["revenues"] for m in ordered)
+    total_expenses = sum(m["expenses"] for m in ordered)
+    conn.close()
+
+    return {
+        "year": year,
+        "rows": ordered,
+        "detail_rows": detail_rows,
+        "total_revenues": total_revenues,
+        "total_expenses": total_expenses,
+        "net_result": total_revenues - total_expenses,
+    }
+
+
+def available_years():
+    conn = get_connection()
+    try:
+        rows = conn.execute("""
+            SELECT DISTINCT SUBSTR(entry_date,1,4) AS y
+            FROM journal_entries
+            WHERE entry_date IS NOT NULL AND entry_date != ''
+              AND SUBSTR(entry_date,1,4) GLOB '[0-9][0-9][0-9][0-9]'
+            ORDER BY y DESC
+        """).fetchall()
+    finally:
+        conn.close()
+    return [r["y"] for r in rows]

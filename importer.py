@@ -58,6 +58,41 @@ def _num(v):
     except Exception:
         return 0.0
 
+
+# أسماء الأعمدة المعروفة لمراكز التكلفة داخل ملف اليومية
+_COST_CENTER_HEADERS = {
+    "مركز التكلفة", "مركز تكلفة", "مركز التكاليف", "مراكز التكلفة",
+    "cost center", "cost_center", "costcentre",
+}
+
+
+def _normalize_header(value):
+    """تطبيع نص عنوان العمود للمقارنة (يزيل المسافات والفواصل)."""
+    s = str(value or "").replace("\n", " ").strip().lower()
+    s = s.replace("_", " ").replace("-", " ").replace("ـ", "")
+    return " ".join(s.split())
+
+
+def _find_cost_center_column(ws):
+    """يبحث في صفوف العناوين عن عمود مراكز التكلفة ويعيد رقم العمود أو None."""
+    for row_idx in (2, 3):
+        for col in range(1, ws.max_column + 1):
+            header = _normalize_header(ws.cell(row_idx, col).value)
+            if header in _COST_CENTER_HEADERS:
+                return col
+    return None
+
+
+def _clean_center_name(value):
+    """تنظيف اسم مركز التكلفة من الخلية."""
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return "" if value == 0 else str(value).strip()
+    s = str(value).replace("\n", " ").replace("ـ", "").strip()
+    return " ".join(s.split())
+
+
 def import_excel_file(file_path: str) -> str:
     init_db()
     wb = load_workbook(file_path, data_only=False)
@@ -89,6 +124,8 @@ def import_excel_file(file_path: str) -> str:
         final_name = raw_name if count == 1 else f"{raw_name} ({count})"
         account_pairs.append((final_name, debit_col, credit_col))
 
+    cost_center_col = _find_cost_center_column(ws)
+
     conn = get_connection()
     cur = conn.cursor()
 
@@ -111,6 +148,25 @@ def import_excel_file(file_path: str) -> str:
 
     entries_count = 0
     lines_count = 0
+    centers_created = []
+    center_ids = {}
+
+    def ensure_cost_center(name):
+        """يستخرج مركز تكلفة من الاسم (ينشئه إن لم يكن موجوداً) ويعيد id أو None."""
+        if name in center_ids:
+            return center_ids[name]
+        row = cur.execute("SELECT id FROM cost_centers WHERE name = ?", (name,)).fetchone()
+        if row:
+            center_ids[name] = row[0]
+            return row[0]
+        now = datetime.now().isoformat(timespec="seconds")
+        cur.execute(
+            "INSERT INTO cost_centers(name, description, created_at) VALUES (?, ?, ?)",
+            (name, "مستورد تلقائياً من ملف اليومية", now)
+        )
+        center_ids[name] = cur.lastrowid
+        centers_created.append(name)
+        return cur.lastrowid
 
     for row in range(4, ws.max_row + 1):
         date_value = ws.cell(row, 1).value
@@ -129,6 +185,13 @@ def import_excel_file(file_path: str) -> str:
         else:
             entry_date = str(date_value)
 
+        # مركز تكلفة القيد كاملاً من العمود المخصص (إن وجد)
+        entry_cost_id = None
+        if cost_center_col:
+            center_name = _clean_center_name(ws.cell(row, cost_center_col).value)
+            if center_name and center_name not in ("الإجمالى", "الإجمـــالى"):
+                entry_cost_id = ensure_cost_center(center_name)
+
         cur.execute(
             """
             INSERT INTO journal_entries(entry_date, reference, description, total_debit, total_credit, source_row)
@@ -146,10 +209,10 @@ def import_excel_file(file_path: str) -> str:
                 continue
             cur.execute(
                 """
-                INSERT INTO journal_lines(entry_id, account_id, debit, credit, line_description)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO journal_lines(entry_id, account_id, debit, credit, line_description, cost_center_id)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (entry_id, account_id_map[account_name], debit, credit, description)
+                (entry_id, account_id_map[account_name], debit, credit, description, entry_cost_id)
             )
             line_added += 1
 
@@ -167,10 +230,15 @@ def import_excel_file(file_path: str) -> str:
     conn.commit()
     conn.close()
 
-    return (
+    result = (
         f"تم استيراد الملف: {os.path.basename(file_path)}\n"
         f"عدد الحسابات: {len(account_pairs)}\n"
         f"عدد القيود: {entries_count}\n"
         f"عدد الحركات: {lines_count}\n"
         "تم تحويل اليومية الأمريكية إلى قاعدة بيانات محاسبية جاهزة للتشغيل."
     )
+    if cost_center_col:
+        result += f"\nتم استيراد مراكز التكلفة تلقائياً: {len(center_ids)} مركز"
+        if centers_created:
+            result += "\n" + "، ".join(centers_created[:10]) + ("..." if len(centers_created) > 10 else "")
+    return result
