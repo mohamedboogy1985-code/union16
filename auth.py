@@ -30,10 +30,11 @@ PERM_EDIT_ENTRIES = "edit"      # إضافة/تعديل/حذف القيود
 PERM_SETTLEMENTS = "settle"     # حفظ وترحيل التسويات البنكية
 PERM_EXPORT = "export"          # تصدير Excel وطباعة PDF
 PERM_USERS = "users"            # إدارة المستخدمين (للمدير فقط)
+PERM_COMPLIANCE = "compliance"  # إعادة الفحص الشامل للائحة واعتماد المخالفات كاستثناء
 
 ROLE_PERMISSIONS = {
-    ROLE_ADMIN: {PERM_IMPORT, PERM_EDIT_ENTRIES, PERM_SETTLEMENTS, PERM_EXPORT, PERM_USERS},
-    ROLE_ACCOUNTANT: {PERM_IMPORT, PERM_EDIT_ENTRIES, PERM_SETTLEMENTS, PERM_EXPORT},
+    ROLE_ADMIN: {PERM_IMPORT, PERM_EDIT_ENTRIES, PERM_SETTLEMENTS, PERM_EXPORT, PERM_USERS, PERM_COMPLIANCE},
+    ROLE_ACCOUNTANT: {PERM_IMPORT, PERM_EDIT_ENTRIES, PERM_SETTLEMENTS, PERM_EXPORT, PERM_COMPLIANCE},
     ROLE_VIEWER: set(),
 }
 

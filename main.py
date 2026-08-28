@@ -48,6 +48,7 @@ from auth import (
     PERM_SETTLEMENTS,
     PERM_EXPORT,
     PERM_USERS,
+    PERM_COMPLIANCE,
 )
 from services import (
     dashboard_summary,
@@ -80,6 +81,22 @@ from services import (
     available_years,
 )
 
+import compliance as CMP
+from compliance import (
+    check_entry as compliance_check_entry,
+    save_violations_for_entry,
+    list_violations,
+    violations_summary,
+    acknowledge_violation,
+    scan_all_entries,
+    check_cash_on_hand,
+    get_settings as compliance_get_settings,
+    save_settings as compliance_save_settings,
+    reset_settings as compliance_reset_settings,
+    SETTING_LABELS,
+    init_compliance_tables,
+)
+
 
 APP_TITLE = "النظام المحاسبي المكتبي المتكامل"
 
@@ -88,6 +105,49 @@ def fmt(v):
         return f"{float(v or 0):,.2f}"
     except Exception:
         return "0.00"
+
+
+class ComplianceWarning(tk.Toplevel):
+    """نافذة إنذار بعدم مطابقة القيد للائحة المالية."""
+
+    def __init__(self, master, message, has_violations=True):
+        super().__init__(master)
+        self.title("إنذار: مخالفة اللائحة المالية")
+        self.geometry("720x520")
+        self.transient(master)
+        self.grab_set()
+        self.confirmed = False
+
+        header = tk.Label(self, text="⛔ تنبيه الرقابة المالية",
+                          font=("Tahoma", 15, "bold"),
+                          fg="white", bg="#b02a2a" if has_violations else "#b8860b")
+        header.pack(fill="x")
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=12, pady=10)
+
+        txt = tk.Text(body, wrap="word", font=("Tahoma", 11), spacing1=2)
+        ys = ttk.Scrollbar(body, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=ys.set)
+        txt.grid(row=0, column=0, sticky="nsew")
+        ys.grid(row=0, column=1, sticky="ns")
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+        txt.insert("1.0", message)
+        txt.configure(state="disabled")
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=12, pady=10)
+        ttk.Button(btns, text="الرجوع للتعديل", command=self._cancel).pack(side="right", padx=6)
+        ttk.Button(btns, text="حفظ رغم التنبيه (تسجيل للمراجعة)",
+                   command=self._confirm).pack(side="left", padx=6)
+
+    def _confirm(self):
+        self.confirmed = True
+        self.destroy()
+
+    def _cancel(self):
+        self.confirmed = False
+        self.destroy()
 
 
 class EntryEditor(tk.Toplevel):
@@ -251,6 +311,33 @@ class EntryEditor(tk.Toplevel):
             messagebox.showerror("خطأ", "القيد غير متوازن")
             return
 
+        # ===== رقابة اللائحة المالية: فحص القيد قبل الحفظ =====
+        draft_lines = [
+            {"account": acc, "debit": d, "credit": c, "desc": desc}
+            for acc, d, c, desc, cost in rows
+        ]
+        cmp_results = compliance_check_entry(
+            date=self.date_var.get(), reference=self.ref_var.get(),
+            description=self.desc_var.get(), draft_lines=draft_lines)
+        blocking = [r for r in cmp_results if r["severity"] == "violation"]
+        approvals = [r for r in cmp_results if r["severity"] == "approval"]
+        if cmp_results:
+            msg_lines = ["⚠️  نتيجة فحص اللائحة المالية لهذا القيد:", ""]
+            for r in cmp_results:
+                tag = {"violation": "❌ مخالفة", "approval": "🟡 يلزم اعتماد",
+                       "info": "ℹ️ تنبيه"}.get(r["severity"], "")
+                msg_lines.append(f"{tag} — {r['article']}")
+                msg_lines.append(r["message"])
+                msg_lines.append("")
+            if blocking or approvals:
+                msg_lines.append("هل تريد حفظ القيد رغم ذلك مع تسجيل الملاحظات للمراجعة؟")
+                win = ComplianceWarning(self, "\n".join(msg_lines), has_violations=bool(blocking))
+                self.wait_window(win)
+                if not win.confirmed:
+                    return
+            else:
+                messagebox.showinfo("فحص اللائحة المالية", "\n".join(msg_lines))
+
         conn = get_connection()
         cur = conn.cursor()
 
@@ -296,6 +383,18 @@ class EntryEditor(tk.Toplevel):
 
         conn.commit()
         conn.close()
+
+        # تسجيل ملاحظات اللائحة في سجل الرقابة
+        if cmp_results:
+            try:
+                save_violations_for_entry(entry_id, cmp_results)
+            except Exception:
+                pass
+        app = getattr(self.master, "app_ref", None) or self.master
+        if hasattr(app, "log_audit"):
+            app.log_audit(
+                "تعديل قيد" if self.entry_id else "إضافة قيد",
+                f"قيد رقم {entry_id} بتاريخ {self.date_var.get()} بمبلغ {fmt(total_debit)}")
         self.master.refresh_all()
         messagebox.showinfo("تم", "تم حفظ القيد بنجاح")
         self.destroy()
@@ -309,6 +408,7 @@ class AccountingApp(tk.Tk):
         self.geometry("1450x900")
         self.minsize(1200, 760)
         init_db()
+        init_compliance_tables()
         self._style()
         self._header()
         self._build_ui()
@@ -383,6 +483,7 @@ class AccountingApp(tk.Tk):
             ("settlements", "التسويات البنكية"),
             ("payroll", "المرتبات"),
             ("reports", "التقارير"),
+            ("compliance", "الرقابة المالية"),
             ("settings", "الإعدادات"),
         ]:
             frame = ttk.Frame(self.nb)
@@ -398,6 +499,7 @@ class AccountingApp(tk.Tk):
         self._build_settlements()
         self._build_payroll()
         self._build_reports()
+        self._build_compliance()
         self._build_settings()
 
     def _subnb(self, parent):
@@ -513,6 +615,10 @@ class AccountingApp(tk.Tk):
 
     def _build_home(self):
         f = self.tabs["home"]
+        self.compliance_badge = ttk.Label(
+            f, text="✅ رقابة اللائحة: جاري التحميل...",
+            style="Section.TLabel", foreground="#1b7a32")
+        self.compliance_badge.pack(anchor="w", padx=14, pady=(6, 0))
         self.home_kpis = self._kpi_row(f)
         self.home_top = ttk.Label(f, text="ملخص عام", style="Section.TLabel")
         self.home_top.pack(anchor="e", padx=10, pady=4)
@@ -1161,6 +1267,385 @@ class AccountingApp(tk.Tk):
                                            (260, 160, 160, 200))
         tf.pack(fill="both", expand=True, padx=10, pady=8)
 
+    def _build_compliance(self):
+        nb = self._subnb(self.tabs["compliance"])
+
+        # ---------- شاشة: فحص القيود / سجل المخالفات ----------
+        log = self._screen(nb, "إنذارات اللائحة المالية")
+        top = ttk.Frame(log); top.pack(fill="x", padx=10, pady=8)
+        ttk.Button(top, text="إعادة فحص كل القيود", command=self.rescan_all_compliance).pack(side="left", padx=4)
+        ttk.Button(top, text="تحديث", command=self.refresh_compliance_log).pack(side="left", padx=4)
+        ttk.Button(top, text="اعتماد المحدد كاستثناء", command=self.ack_selected_violation).pack(side="left", padx=4)
+        ttk.Button(top, text="فتح القيد", command=self.open_violation_entry).pack(side="left", padx=4)
+        ttk.Button(top, text="تصدير Excel", command=self.export_compliance).pack(side="left", padx=4)
+        self.cmp_filter_var = tk.StringVar(value="الكل")
+        ttk.Label(top, text="النوع").pack(side="right", padx=4)
+        filt = ttk.Combobox(top, textvariable=self.cmp_filter_var, width=22, state="readonly",
+                            values=["الكل", "مخالفات فقط", "يلزم اعتماد", "تنبيهات", "المعتمدة كاستثناء"])
+        filt.pack(side="right", padx=4)
+        filt.bind("<<ComboboxSelected>>", lambda e: self.refresh_compliance_log())
+
+        self.cmp_summary_lbl = ttk.Label(log, text="", style="Section.TLabel")
+        self.cmp_summary_lbl.pack(anchor="e", padx=10)
+
+        tf, self.cmp_tree = self._tree(
+            log,
+            ("id", "date", "ref", "article", "severity", "message", "amount", "checked", "ack"),
+            ("#", "تاريخ القيد", "المرجع", "المادة", "النوع", "نص الإنذار / الملاحظة", "المبلغ", "وقت الفحص", "الحالة"),
+            (50, 95, 100, 90, 110, 520, 100, 120, 110))
+        tf.pack(fill="both", expand=True, padx=10, pady=8)
+        self.cmp_tree.tag_configure("violation", background="#f8d7da")
+        self.cmp_tree.tag_configure("approval", background="#fff3cd")
+        self.cmp_tree.tag_configure("info", background="#d1ecf1")
+        self.cmp_tree.tag_configure("ack", background="#e2e2e2", foreground="#666")
+
+        # ---------- شاشة: فحص فوري لقيد ----------
+        live = self._screen(nb, "فحص قيد فوري")
+        ltop = ttk.Frame(live); ltop.pack(fill="x", padx=10, pady=8)
+        ttk.Label(ltop, text="التاريخ").pack(side="right", padx=4)
+        self.cmp_live_date = tk.StringVar(value=datetime.today().strftime("%Y-%m-%d"))
+        ttk.Entry(ltop, textvariable=self.cmp_live_date, width=12).pack(side="right", padx=4)
+        ttk.Label(ltop, text="المرجع").pack(side="right", padx=4)
+        self.cmp_live_ref = tk.StringVar()
+        ttk.Entry(ltop, textvariable=self.cmp_live_ref, width=16).pack(side="right", padx=4)
+        ttk.Label(ltop, text="البيان / الغرض").pack(side="right", padx=4)
+        self.cmp_live_desc = tk.StringVar()
+        ttk.Entry(ltop, textvariable=self.cmp_live_desc, width=44).pack(side="right", padx=4)
+        ttk.Button(ltop, text="فحص", command=self.refresh_compliance_live).pack(side="left", padx=4)
+
+        mid = ttk.LabelFrame(live, text="سطور القيد (الحساب - مدين - دائن - بيان)")
+        mid.pack(fill="both", expand=False, padx=10, pady=6)
+        tools = ttk.Frame(mid); tools.pack(fill="x", padx=6, pady=4)
+        ttk.Button(tools, text="إضافة سطر", command=self.cmp_live_add_row).pack(side="left", padx=4)
+        ttk.Button(tools, text="حذف سطر", command=self.cmp_live_del_row).pack(side="left", padx=4)
+        self.cmp_live_tree = ttk.Treeview(mid, columns=("account", "debit", "credit", "desc"),
+                                          show="headings", height=6)
+        for c, h, w in [("account", "الحساب", 360), ("debit", "مدين", 110),
+                        ("credit", "دائن", 110), ("desc", "بيان السطر", 320)]:
+            self.cmp_live_tree.heading(c, text=h)
+            self.cmp_live_tree.column(c, width=w, anchor="center")
+        self.cmp_live_tree.pack(fill="x", padx=6, pady=4)
+        edit = ttk.Frame(mid); edit.pack(fill="x", padx=6, pady=4)
+        self.cmp_row_account = tk.StringVar()
+        self.cmp_row_debit = tk.StringVar(value="0")
+        self.cmp_row_credit = tk.StringVar(value="0")
+        self.cmp_row_desc = tk.StringVar()
+        ttk.Label(edit, text="الحساب").pack(side="right", padx=3)
+        ttk.Combobox(edit, textvariable=self.cmp_row_account, width=34, values=ledger_accounts()).pack(side="right", padx=3)
+        ttk.Label(edit, text="مدين").pack(side="right", padx=3)
+        ttk.Entry(edit, textvariable=self.cmp_row_debit, width=11).pack(side="right", padx=3)
+        ttk.Label(edit, text="دائن").pack(side="right", padx=3)
+        ttk.Entry(edit, textvariable=self.cmp_row_credit, width=11).pack(side="right", padx=3)
+        ttk.Label(edit, text="بيان").pack(side="right", padx=3)
+        ttk.Entry(edit, textvariable=self.cmp_row_desc, width=28).pack(side="right", padx=3)
+        ttk.Button(edit, text="تطبيق على السطر", command=self.cmp_live_apply_row).pack(side="left", padx=3)
+        self.cmp_live_tree.bind("<<TreeviewSelect>>", self.cmp_live_load_row)
+
+        res_box = ttk.LabelFrame(live, text="نتيجة الفحص")
+        res_box.pack(fill="both", expand=True, padx=10, pady=6)
+        self.cmp_live_result = tk.Text(res_box, wrap="word", font=("Tahoma", 11), height=10)
+        rys = ttk.Scrollbar(res_box, orient="vertical", command=self.cmp_live_result.yview)
+        self.cmp_live_result.configure(yscrollcommand=rys.set)
+        self.cmp_live_result.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+        rys.pack(side="right", fill="y", pady=6)
+        self.cmp_live_result.tag_configure("violation", foreground="#b00020", font=("Tahoma", 11, "bold"))
+        self.cmp_live_result.tag_configure("approval", foreground="#9c6500")
+        self.cmp_live_result.tag_configure("info", foreground="#0b5b78")
+        self.cmp_live_result.tag_configure("ok", foreground="#1b7a32", font=("Tahoma", 12, "bold"))
+
+        # ---------- شاشة: حدود اللائحة (الإعدادات) ----------
+        rules = self._screen(nb, "حدود اللائحة المالية")
+        rtop = ttk.Frame(rules); rtop.pack(fill="x", padx=10, pady=8)
+        ttk.Button(rtop, text="حفظ الحدود", command=self.save_compliance_limits).pack(side="left", padx=4)
+        ttk.Button(rtop, text="استرجاع حدود اللائحة الافتراضية", command=self.reset_compliance_limits).pack(side="left", padx=4)
+        ttk.Label(rtop, text="نطاق الجهة").pack(side="right", padx=6)
+        self.cmp_scope_var = tk.StringVar()
+        scope_combo = ttk.Combobox(rtop, textvariable=self.cmp_scope_var, width=18, state="readonly",
+                                   values=["union: نقابة عامة", "committee: لجنة نقابية"])
+        scope_combo.pack(side="right", padx=6)
+        tf, self.cmp_rules_tree = self._tree(
+            rules, ("key", "group", "label", "value", "ref"),
+            ("م", "المجموعة", "البند", "الحد الحالي", "المرجع / النص"),
+            (40, 120, 260, 120, 600))
+        tf.pack(fill="both", expand=True, padx=10, pady=8)
+        self.cmp_rules_tree.bind("<Double-1>", self.edit_compliance_limit)
+
+        # ---------- شاشة: رصيد الخزينة ----------
+        cash = self._screen(nb, "رقابة رصيد الخزينة (مادة 6)")
+        ctop = ttk.Frame(cash); ctop.pack(fill="x", padx=10, pady=8)
+        ttk.Button(ctop, text="فحص رصيد الخزينة الآن", command=self.refresh_compliance_cash).pack(side="left", padx=4)
+        tf, self.cmp_cash_tree = self._tree(
+            cash, ("account", "balance", "cap", "status"),
+            ("الحساب", "الرصيد الحالي", "سقف اللائحة", "الحالة"),
+            (300, 160, 160, 500))
+        tf.pack(fill="both", expand=True, padx=10, pady=8)
+        self.cmp_cash_tree.tag_configure("violation", background="#f8d7da")
+        self.cmp_cash_tree.tag_configure("ok", background="#d4edda")
+
+    # ----- لقطة الفحص الفوري -----
+    def cmp_live_add_row(self):
+        iid = self.cmp_live_tree.insert("", "end", values=("", "0", "0", ""))
+        self.cmp_live_tree.selection_set(iid)
+
+    def cmp_live_del_row(self):
+        for iid in self.cmp_live_tree.selection():
+            self.cmp_live_tree.delete(iid)
+
+    def cmp_live_load_row(self, event=None):
+        sel = self.cmp_live_tree.selection()
+        if not sel:
+            return
+        v = self.cmp_live_tree.item(sel[0], "values")
+        self.cmp_row_account.set(v[0])
+        self.cmp_row_debit.set(v[1])
+        self.cmp_row_credit.set(v[2])
+        self.cmp_row_desc.set(v[3])
+
+    def cmp_live_apply_row(self):
+        sel = self.cmp_live_tree.selection()
+        if not sel:
+            return
+        self.cmp_live_tree.item(sel[0], values=(
+            self.cmp_row_account.get().strip(),
+            self.cmp_row_debit.get().strip() or "0",
+            self.cmp_row_credit.get().strip() or "0",
+            self.cmp_row_desc.get().strip()))
+
+    def refresh_compliance_live(self):
+        draft = []
+        for iid in self.cmp_live_tree.get_children():
+            acc, d, c, desc = self.cmp_live_tree.item(iid, "values")
+            if not str(acc).strip():
+                continue
+            draft.append({"account": str(acc).strip(),
+                          "debit": float(d or 0), "credit": float(c or 0),
+                          "desc": str(desc or "")})
+        res = compliance_check_entry(date=self.cmp_live_date.get(),
+                                     reference=self.cmp_live_ref.get(),
+                                     description=self.cmp_live_desc.get(),
+                                     draft_lines=draft)
+        self.cmp_live_result.configure(state="normal")
+        self.cmp_live_result.delete("1.0", "end")
+        if not draft:
+            self.cmp_live_result.insert("end", "أدخل سطور القيد أولاً ثم اضغط (فحص).", "info")
+        elif not res:
+            self.cmp_live_result.insert("end", "✅ القيد مطابق للائحة المالية — لا توجد ملاحظات.", "ok")
+        else:
+            for r in res:
+                tag = r["severity"]
+                tag_txt = {"violation": "❌ مخالفة للائحة", "approval": "🟡 يلزم موافقة / اعتماد",
+                           "info": "ℹ️ تنبيه إرشادي"}.get(tag, tag)
+                self.cmp_live_result.insert("end", f"{tag_txt} — {r['article']}\n", tag)
+                self.cmp_live_result.insert("end", r["message"] + "\n\n")
+        self.cmp_live_result.configure(state="disabled")
+
+    # ----- سجل المخالفات -----
+    def rescan_all_compliance(self):
+        if not has_permission(self.current_user, PERM_COMPLIANCE):
+            messagebox.showerror("صلاحية مرفوضة", "دورك لا يسمح بإعادة الفحص الشامل للائحة (متاح لمدير النظام والمراجع).")
+            return
+        if not messagebox.askyesno("تأكيد", "سيتم إعادة فحص جميع قيود اليومية مقابل اللائحة المالية. متابعة؟"):
+            return
+        entries = self._all_entry_ids()
+        count = 0
+        for eid in entries:
+            res = compliance_check_entry(entry_id=eid)
+            if res:
+                save_violations_for_entry(eid, res)
+                count += 1
+        if hasattr(self, "log_audit"):
+            self.log_audit("فحص شامل للائحة", f"فحص {len(entries)} قيد، قيود عليها ملاحظات: {count}")
+        self.refresh_compliance_log()
+        self.refresh_compliance_cash()
+        self.refresh_compliance_badge()
+        messagebox.showinfo("تم", f"اكتمل الفحص الشامل.\nقيود عليها ملاحظات: {count} من {len(entries)} قيد.")
+
+    def _all_entry_ids(self):
+        conn = get_connection()
+        ids = [r[0] for r in conn.execute("SELECT id FROM journal_entries ORDER BY id").fetchall()]
+        conn.close()
+        return ids
+
+    def refresh_compliance_log(self):
+        f = self.cmp_filter_var.get()
+        include_ack = (f == "المعتمدة كاستثناء")
+        rows = list_violations(include_ack=include_ack)
+        if f == "مخالفات فقط":
+            rows = [r for r in rows if r["severity"] == "violation"]
+        elif f == "يلزم اعتماد":
+            rows = [r for r in rows if r["severity"] == "approval"]
+        elif f == "تنبيهات":
+            rows = [r for r in rows if r["severity"] == "info"]
+        sev_txt = {"violation": "❌ مخالفة", "approval": "🟡 يلزم اعتماد", "info": "ℹ️ تنبيه"}
+        for iid in self.cmp_tree.get_children():
+            self.cmp_tree.delete(iid)
+        for r in rows:
+            tag = "ack" if r["acknowledged"] else r["severity"]
+            self.cmp_tree.insert(
+                "", "end", iid=f"v{r['id']}",
+                values=(r["id"], r["entry_date"] or "", r["entry_ref"] or "",
+                        r["article"] or "",
+                        "معتمد كاستثناء" if r["acknowledged"] else sev_txt.get(r["severity"], r["severity"]),
+                        r["message"] or "", fmt(r["amount"]),
+                        r["checked_at"] or "",
+                        (r["ack_note"] or "استثناء معتمد") if r["acknowledged"] else "قائم"),
+                tags=(tag,))
+        summ = violations_summary()
+        self.cmp_summary_lbl.config(
+            text=(f"المخالفات: {summ['violation']}  |  يلزم اعتماد: {summ['approval']}  |  "
+                  f"تنبيهات: {summ['info']}"))
+        self.cmp_rows = rows
+
+    def ack_selected_violation(self):
+        if not has_permission(self.current_user, PERM_COMPLIANCE):
+            messagebox.showerror("صلاحية مرفوضة", "دورك لا يسمح باعتماد مخالفات اللائحة كاستثناء (متاح للمراجع ومدير النظام).")
+            return
+        sel = self.cmp_tree.selection()
+        if not sel:
+            messagebox.showinfo("تنبيه", "اختر ملاحظة من القائمة أولاً")
+            return
+        note = "معتمدة من المسؤول كاستثناء"
+        ids = []
+        for iid in sel:
+            vid = int(iid[1:])
+            acknowledge_violation(vid, note)
+            ids.append(str(vid))
+        if hasattr(self, "log_audit"):
+            self.log_audit("اعتماد مخالفة لائحة", f"ملاحظات أرقام: {', '.join(ids)}")
+        self.refresh_compliance_log()
+        self.refresh_compliance_badge()
+
+    def open_violation_entry(self):
+        sel = self.cmp_tree.selection()
+        if not sel:
+            return
+        vid = int(sel[0][1:])
+        row = next((r for r in getattr(self, "cmp_rows", []) if r["id"] == vid), None)
+        if row and row["entry_id"]:
+            EntryEditor(self, entry_id=row["entry_id"])
+
+    def export_compliance(self):
+        rows = getattr(self, "cmp_rows", [])
+        data = [(r["id"], r["entry_date"], r["entry_ref"], r["article"], r["severity"],
+                 r["message"], r["amount"], r["checked_at"],
+                 "معتمد" if r["acknowledged"] else "قائم") for r in rows]
+        self.export_simple_excel(
+            data,
+            ["#", "التاريخ", "المرجع", "المادة", "النوع", "الرسالة", "المبلغ", "وقت الفحص", "الحالة"],
+            "تقرير_الرقابة_المالية")
+
+    # ----- حدود اللائحة -----
+    def _populate_rules_tree(self, tree):
+        settings = compliance_get_settings()
+        for iid in tree.get_children():
+            tree.delete(iid)
+        for i, (key, (label, ref, group)) in enumerate(SETTING_LABELS.items(), start=1):
+            if key == "entity_scope":
+                continue
+            val = settings.get(key, "")
+            tree.insert("", "end", iid=f"r_{key}", values=(i, group, label, val, ref))
+
+    def refresh_compliance_rules(self):
+        settings = compliance_get_settings()
+        scope = settings.get("entity_scope", "union")
+        self.cmp_scope_var.set(f"{scope}: {'نقابة عامة' if scope == 'union' else 'لجنة نقابية'}")
+        self._populate_rules_tree(self.cmp_rules_tree)
+        if hasattr(self, "st_rules_tree"):
+            self._populate_rules_tree(self.st_rules_tree)
+
+    def _edit_limit_on_tree(self, tree, event=None):
+        if not has_permission(self.current_user, PERM_COMPLIANCE):
+            messagebox.showerror("صلاحية مرفوضة", "دورك لا يسمح بتعديل حدود اللائحة.")
+            return
+        sel = tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        vals = tree.item(iid, "values")
+        key = iid[2:]
+        from tkinter import simpledialog
+        new_val = simpledialog.askstring("تعديل الحد",
+                                         f"{vals[2]}\nالمرجع: {vals[4]}\nأدخل القيمة الجديدة:",
+                                         initialvalue=str(vals[3]), parent=self)
+        if new_val is None:
+            return
+        compliance_save_settings({key: new_val.strip()})
+        if hasattr(self, "log_audit"):
+            self.log_audit("تعديل حد لائحة", f"{vals[2]}: {vals[3]} -> {new_val}")
+        self.refresh_compliance_rules()
+        messagebox.showinfo("تم", "تم حفظ الحد الجديد")
+
+    def edit_compliance_limit(self, event=None):
+        self._edit_limit_on_tree(self.cmp_rules_tree, event)
+
+    def save_compliance_limits(self):
+        if not has_permission(self.current_user, PERM_COMPLIANCE):
+            messagebox.showerror("صلاحية مرفوضة", "دورك لا يسمح بتعديل الإعدادات.")
+            return
+        scope_raw = self.cmp_scope_var.get()
+        scope = "committee" if scope_raw.startswith("committee") else "union"
+        compliance_save_settings({"entity_scope": scope})
+        if hasattr(self, "log_audit"):
+            self.log_audit("تعديل نطاق الجهة", scope)
+        self.refresh_compliance_rules()
+        self.refresh_compliance_log()
+        if hasattr(self, "st_scope_var"):
+            self.st_scope_var.set(self.cmp_scope_var.get())
+        messagebox.showinfo("تم", "تم حفظ حدود اللائحة ونطاق الجهة")
+
+    def reset_compliance_limits(self):
+        if not has_permission(self.current_user, PERM_COMPLIANCE):
+            messagebox.showerror("صلاحية مرفوضة", "دورك لا يسمح بتعديل الإعدادات.")
+            return
+        if not messagebox.askyesno("تأكيد", "سيتم استرجاع جميع حدود اللائحة الافتراضية. متابعة؟"):
+            return
+        compliance_reset_settings()
+        self.refresh_compliance_rules()
+        messagebox.showinfo("تم", "تم استرجاع الحدود الافتراضية")
+
+    # ----- رصيد الخزينة -----
+    def refresh_compliance_cash(self):
+        for iid in self.cmp_cash_tree.get_children():
+            self.cmp_cash_tree.delete(iid)
+        settings = compliance_get_settings()
+        is_union = settings.get("entity_scope", "union") != "committee"
+        cap = settings["cash_on_hand_union"] if is_union else settings["cash_on_hand_committee"]
+        results = check_cash_on_hand()
+        if not results:
+            conn = get_connection()
+            rows = conn.execute("""
+                SELECT a.name, COALESCE(SUM(jl.debit),0)-COALESCE(SUM(jl.credit),0) bal
+                FROM accounts a JOIN journal_lines jl ON jl.account_id=a.id
+                WHERE a.name LIKE '%خزينة%' OR a.name LIKE '%صندوق%' OR a.name LIKE '%نقد%'
+                GROUP BY a.id HAVING bal > 0
+            """).fetchall()
+            conn.close()
+            if not rows:
+                self.cmp_cash_tree.insert("", "end", values=("لا توجد أرصدة خزينة ظاهرة", "-", fmt(cap), "-"))
+            for r in rows:
+                self.cmp_cash_tree.insert("", "end",
+                                          values=(r[0], fmt(r[1]), fmt(cap), "✅ ضمن الحد"),
+                                          tags=("ok",))
+        for r in results:
+            self.cmp_cash_tree.insert("", "end",
+                                      values=(r["account"], fmt(r["amount"]), fmt(cap), r["message"]),
+                                      tags=("violation",))
+
+    # ----- شارة المخالفات في الرئيسية -----
+    def refresh_compliance_badge(self):
+        try:
+            summ = violations_summary()
+            total = summ["violation"] + summ["approval"]
+            if total > 0:
+                self.compliance_badge.config(
+                    text=f"⚠️ رقابة اللائحة: {summ['violation']} مخالفة و {summ['approval']} بانتظار اعتماد",
+                    foreground="#b00020")
+            else:
+                self.compliance_badge.config(
+                    text="✅ رقابة اللائحة: لا توجد مخالفات قائمة", foreground="#1b7a32")
+        except Exception:
+            pass
+
     def _build_settings(self):
         nb = self._subnb(self.tabs["settings"])
 
@@ -1720,6 +2205,11 @@ class AccountingApp(tk.Tk):
         self.refresh_pattern_report("expenses")
         self.refresh_people_names()
         self.refresh_monthly()
+        self.refresh_compliance_log()
+        self.refresh_compliance_rules()
+        self.refresh_compliance_cash()
+        self.refresh_compliance_live()
+        self.refresh_compliance_badge()
         if hasattr(self, "users_tree"):
             self.refresh_users()
 
