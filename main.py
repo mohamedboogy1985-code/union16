@@ -32,23 +32,22 @@ from pdf_reports import (
     build_voucher_pdf,
     build_settlement_pdf,
 )
-from auth import (
-    authenticate,
-    has_permission,
-    users_list,
+import app_settings as APPS
+from app_settings import (
+    ROLES,
+    PERMISSION_LABELS,
+    init_settings_tables,
+    get_all_settings,
+    set_settings,
+    set_setting,
+    get_json_setting,
+    verify_user,
+    list_users,
     add_user,
     update_user,
-    delete_user,
-    ROLE_ADMIN,
-    ROLE_ACCOUNTANT,
-    ROLE_VIEWER,
-    ROLE_LABELS,
-    PERM_IMPORT,
-    PERM_EDIT_ENTRIES,
-    PERM_SETTLEMENTS,
-    PERM_EXPORT,
-    PERM_USERS,
-    PERM_COMPLIANCE,
+    can as user_can,
+    log_action,
+    list_audit,
 )
 from services import (
     dashboard_summary,
@@ -409,6 +408,7 @@ class AccountingApp(tk.Tk):
         self.minsize(1200, 760)
         init_db()
         init_compliance_tables()
+        init_settings_tables()
         self._style()
         self._header()
         self._build_ui()
@@ -435,7 +435,8 @@ class AccountingApp(tk.Tk):
         top.pack_propagate(False)
         ttk.Label(top, text="نظام محاسبي مكتبي متكامل", style="Header.TLabel").pack(side="right", padx=16, pady=12)
         user = self.current_user or {}
-        user_info = f"{user.get('full_name') or user.get('username') or 'مستخدم'} ({user.get('role_label') or '-'})"
+        role_label = ROLES.get(user.get("role"), {}).get("label", user.get("role") or "-")
+        user_info = f"{user.get('full_name') or user.get('username') or 'مستخدم'} ({role_label})"
         ttk.Label(top, text=user_info, style="Header.TLabel", font=("Tahoma", 10)).pack(side="left", padx=16)
         ttk.Button(top, text="تسجيل الخروج", command=self.logout).pack(side="left", padx=4)
         btns = tk.Frame(top, bg="#0f4c81")
@@ -467,6 +468,26 @@ class AccountingApp(tk.Tk):
     def logout(self):
         if messagebox.askyesno("تسجيل الخروج", "هل تريد تسجيل الخروج؟"):
             self.destroy()
+
+    def log_audit(self, action, details=""):
+        uname = self.current_user["username"] if self.current_user else "غير معروف"
+        log_action(uname, action, details)
+
+    def can(self, permission):
+        if not self.current_user:
+            return False
+        return user_can(self.current_user["role"], permission)
+
+    def deny(self, message="لا تملك صلاحية لهذا الإجراء."):
+        messagebox.showerror("صلاحية مرفوضة", message)
+
+    def _guard_button(self, btn, permission):
+        # اعتراض الضغطة: منع تنفيذ أمر الزر إذا لم تتوفر الصلاحية
+        def on_click(event):
+            if not self.can(permission):
+                self.deny(f"دورك لا يسمح بـ ({PERMISSION_LABELS.get(permission, permission)})")
+                return "break"
+        btn.bind("<Button-1>", on_click)
 
     def _build_ui(self):
         self.nb = ttk.Notebook(self)
@@ -575,41 +596,57 @@ class AccountingApp(tk.Tk):
         build_settlement_pdf(path, payload)
 
     def import_journal(self):
+        if not self.can("import"):
+            self.deny("دورك لا يسمح باستيراد ملفات اليومية.")
+            return
         path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")])
         if not path:
             return
         try:
             msg = import_excel_file(path)
+            self.log_audit("استيراد يومية أمريكية", os.path.basename(path))
             self.refresh_all()
             messagebox.showinfo("نجاح", msg)
         except Exception as e:
             messagebox.showerror("خطأ", str(e))
 
     def import_payroll(self):
+        if not self.can("import"):
+            self.deny("دورك لا يسمح باستيراد ملفات المرتبات.")
+            return
         path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")])
         if not path:
             return
         try:
             msg = import_payroll_excel(path)
+            self.log_audit("استيراد مرتبات", os.path.basename(path))
             self.refresh_all()
             messagebox.showinfo("نجاح", msg)
         except Exception as e:
             messagebox.showerror("خطأ", str(e))
 
     def backup_db(self):
+        if not self.can("backup"):
+            self.deny("دورك لا يسمح بإنشاء نسخة احتياطية.")
+            return
         path = filedialog.asksaveasfilename(defaultextension=".db", filetypes=[("SQLite", "*.db")], initialfile=f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db")
         if not path:
             return
         shutil.copyfile(DB_PATH, path)
+        self.log_audit("نسخة احتياطية", os.path.basename(path))
         messagebox.showinfo("تم", "تم حفظ النسخة الاحتياطية")
 
     def restore_db(self):
+        if not self.can("restore"):
+            self.deny("دورك لا يسمح باسترجاع نسخة احتياطية.")
+            return
         path = filedialog.askopenfilename(filetypes=[("SQLite", "*.db")])
         if not path:
             return
         if not messagebox.askyesno("تأكيد", "سيتم استبدال قاعدة البيانات الحالية. هل تريد المتابعة؟"):
             return
         shutil.copyfile(path, DB_PATH)
+        self.log_audit("استرجاع نسخة احتياطية", os.path.basename(path))
         self.refresh_all()
         messagebox.showinfo("تم", "تم استرجاع النسخة الاحتياطية")
 
@@ -1441,8 +1478,8 @@ class AccountingApp(tk.Tk):
 
     # ----- سجل المخالفات -----
     def rescan_all_compliance(self):
-        if not has_permission(self.current_user, PERM_COMPLIANCE):
-            messagebox.showerror("صلاحية مرفوضة", "دورك لا يسمح بإعادة الفحص الشامل للائحة (متاح لمدير النظام والمراجع).")
+        if not self.can("compliance_rescan"):
+            self.deny("دورك لا يسمح بإعادة الفحص الشامل للائحة (متاح للمراجع ومدير النظام).")
             return
         if not messagebox.askyesno("تأكيد", "سيتم إعادة فحص جميع قيود اليومية مقابل اللائحة المالية. متابعة؟"):
             return
@@ -1497,8 +1534,8 @@ class AccountingApp(tk.Tk):
         self.cmp_rows = rows
 
     def ack_selected_violation(self):
-        if not has_permission(self.current_user, PERM_COMPLIANCE):
-            messagebox.showerror("صلاحية مرفوضة", "دورك لا يسمح باعتماد مخالفات اللائحة كاستثناء (متاح للمراجع ومدير النظام).")
+        if not self.can("compliance_ack"):
+            self.deny("دورك لا يسمح باعتماد مخالفات اللائحة كاستثناء (متاح للمراجع ومدير النظام).")
             return
         sel = self.cmp_tree.selection()
         if not sel:
@@ -1554,8 +1591,8 @@ class AccountingApp(tk.Tk):
             self._populate_rules_tree(self.st_rules_tree)
 
     def _edit_limit_on_tree(self, tree, event=None):
-        if not has_permission(self.current_user, PERM_COMPLIANCE):
-            messagebox.showerror("صلاحية مرفوضة", "دورك لا يسمح بتعديل حدود اللائحة.")
+        if not self.can("settings"):
+            self.deny("دورك لا يسمح بتعديل حدود اللائحة.")
             return
         sel = tree.selection()
         if not sel:
@@ -1579,8 +1616,8 @@ class AccountingApp(tk.Tk):
         self._edit_limit_on_tree(self.cmp_rules_tree, event)
 
     def save_compliance_limits(self):
-        if not has_permission(self.current_user, PERM_COMPLIANCE):
-            messagebox.showerror("صلاحية مرفوضة", "دورك لا يسمح بتعديل الإعدادات.")
+        if not self.can("settings"):
+            self.deny("دورك لا يسمح بتعديل إعدادات اللائحة.")
             return
         scope_raw = self.cmp_scope_var.get()
         scope = "committee" if scope_raw.startswith("committee") else "union"
@@ -1594,8 +1631,8 @@ class AccountingApp(tk.Tk):
         messagebox.showinfo("تم", "تم حفظ حدود اللائحة ونطاق الجهة")
 
     def reset_compliance_limits(self):
-        if not has_permission(self.current_user, PERM_COMPLIANCE):
-            messagebox.showerror("صلاحية مرفوضة", "دورك لا يسمح بتعديل الإعدادات.")
+        if not self.can("settings"):
+            self.deny("دورك لا يسمح بتعديل حدود اللائحة.")
             return
         if not messagebox.askyesno("تأكيد", "سيتم استرجاع جميع حدود اللائحة الافتراضية. متابعة؟"):
             return
@@ -1649,177 +1686,407 @@ class AccountingApp(tk.Tk):
     def _build_settings(self):
         nb = self._subnb(self.tabs["settings"])
 
-        people = self._screen(nb, "إدارة أسماء الأشخاص")
-        ttk.Label(people, text="الأسماء المستخرجة من البيانات الحالية", style="Section.TLabel").pack(anchor="e", padx=10, pady=10)
-        tf, self.people_tree = self._tree(people, ("name",), ("الاسم",), (500,))
+        # ================================================================
+        # 1) إعدادات النظام العامة
+        # ================================================================
+        gen = self._screen(nb, "النظام العامة")
+        gf = ttk.LabelFrame(gen, text="بيانات المنشأة")
+        gf.pack(fill="x", padx=12, pady=8)
+        self.st_general_vars = {}
+        for key, label in [
+            ("org_name", "اسم المنشأة"),
+            ("tax_registration", "رقم التسجيل الضريبي"),
+            ("fiscal_year", "السنة المالية"),
+            ("currency", "العملة"),
+        ]:
+            row = ttk.Frame(gf); row.pack(fill="x", padx=10, pady=4)
+            ttk.Label(row, text=label, width=22).pack(side="right", padx=4)
+            var = tk.StringVar()
+            ttk.Entry(row, textvariable=var, width=60).pack(side="right", fill="x", expand=True, padx=4)
+            self.st_general_vars[key] = var
+
+        ttk.Button(gf, text="اختيار الشعار", command=self.pick_logo).pack(side="right", padx=10, pady=6)
+        self.st_logo_lbl = ttk.Label(gf, text="")
+        self.st_logo_lbl.pack(side="right", padx=4)
+
+        nf = ttk.LabelFrame(gen, text="التنبيهات")
+        nf.pack(fill="x", padx=12, pady=8)
+        self.st_notify_vars = {}
+        for key, label in [
+            ("notify_cash_cap", "تنبيه تجاوز سقف الخزينة (مادة 6)"),
+            ("notify_violations", "تنبيه مخالفات اللائحة المالية"),
+            ("notify_monthly_close", "تنبيه الجرد الشهري وإقفال الشهر (مادة 16)"),
+        ]:
+            var = tk.IntVar()
+            ttk.Checkbutton(nf, text=label, variable=var).pack(anchor="e", padx=12, pady=3)
+            self.st_notify_vars[key] = var
+        ttk.Button(gen, text="حفظ إعدادات النظام العامة", command=self.save_general_settings).pack(anchor="e", padx=16, pady=8)
+
+        # ================================================================
+        # 2) إعدادات اللائحة المالية
+        # ================================================================
+        reg = self._screen(nb, "اللائحة المالية")
+        top = ttk.Frame(reg); top.pack(fill="x", padx=10, pady=6)
+        ttk.Button(top, text="حفظ حدود اللائحة", command=self.save_compliance_limits).pack(side="left", padx=4)
+        ttk.Button(top, text="استرجاع الحدود الافتراضية", command=self.reset_compliance_limits).pack(side="left", padx=4)
+        ttk.Label(top, text="نطاق الجهة").pack(side="right", padx=6)
+        self.st_scope_var = tk.StringVar()
+        ttk.Combobox(top, textvariable=self.st_scope_var, width=20, state="readonly",
+                     values=["union: نقابة عامة", "committee: لجنة نقابية"]).pack(side="right", padx=6)
+        tf, self.st_rules_tree = self._tree(
+            reg, ("key", "group", "label", "value", "ref"),
+            ("م", "المجموعة", "البند", "الحد الحالي", "المرجع / نص المادة"),
+            (40, 120, 260, 120, 620))
+        tf.pack(fill="both", expand=True, padx=10, pady=8)
+        self.st_rules_tree.bind("<Double-1>", lambda e: self._edit_limit_on_tree(self.st_rules_tree, e))
+        ttk.Label(reg, text="لتعديل أي حد: نقرة مزدوجة على الصف.", foreground="#777").pack(anchor="e", padx=14)
+
+        # ================================================================
+        # 3) إعدادات الحسابات والضرائب
+        # ================================================================
+        tax = self._screen(nb, "الحسابات والضرائب")
+        tlf = ttk.LabelFrame(tax, text="الفاتورة الإلكترونية")
+        tlf.pack(fill="x", padx=12, pady=8)
+        self.st_tax_vars = {}
+        for key, label in [
+            ("einvoice_client_id", "Client ID"),
+            ("einvoice_client_secret", "Client Secret"),
+            ("einvoice_activity_code", "كود النشاط"),
+        ]:
+            row = ttk.Frame(tlf); row.pack(fill="x", padx=10, pady=3)
+            ttk.Label(row, text=label, width=20).pack(side="right", padx=4)
+            var = tk.StringVar()
+            ttk.Entry(row, textvariable=var, width=46).pack(side="right", padx=4)
+            self.st_tax_vars[key] = var
+        row = ttk.Frame(tlf); row.pack(fill="x", padx=10, pady=3)
+        ttk.Label(row, text="بيئة الفاتورة الإلكترونية", width=24).pack(side="right", padx=4)
+        self.st_env_var = tk.StringVar()
+        ttk.Combobox(row, textvariable=self.st_env_var, width=20, state="readonly",
+                     values=["test", "production"]).pack(side="right", padx=4)
+        self.st_einvoice_var = tk.IntVar()
+        ttk.Checkbutton(tlf, text="تفعيل الربط مع الفاتورة الإلكترونية",
+                        variable=self.st_einvoice_var).pack(anchor="e", padx=12, pady=4)
+
+        rates = ttk.LabelFrame(tax, text="النسب الضريبية")
+        rates.pack(fill="x", padx=12, pady=8)
+        for key, label in [
+            ("vat_rate", "ضريبة القيمة المضافة %"),
+            ("withholding_fees_pct", "خصم تحت حساب الضريبة - أتعاب مهنية %"),
+            ("withholding_commissions_pct", "خصم تحت حساب الضريبة - عمولات وسمسرة %"),
+            ("withholding_supply_pct", "خصم تحت حساب الضريبة - مقاولات وتوريدات %"),
+            ("withholding_min_amount", "حد تطبيق الخصم (جنيه)"),
+        ]:
+            row = ttk.Frame(rates); row.pack(fill="x", padx=10, pady=3)
+            ttk.Label(row, text=label, width=44).pack(side="right", padx=4)
+            var = tk.StringVar()
+            ttk.Entry(row, textvariable=var, width=14).pack(side="right", padx=4)
+            self.st_tax_vars[key] = var
+        ttk.Button(tax, text="حفظ إعدادات الحسابات والضرائب",
+                   command=self.save_tax_settings).pack(anchor="e", padx=16, pady=8)
+
+        # ================================================================
+        # 4) الموارد البشرية والمرتبات
+        # ================================================================
+        hr = self._screen(nb, "الموارد البشرية والمرتبات")
+        ins = ttk.LabelFrame(hr, text="التأمينات الاجتماعية")
+        ins.pack(fill="x", padx=12, pady=8)
+        self.st_hr_vars = {}
+        for key, label in [
+            ("ins_employee_pct", "حصة العامل %"),
+            ("ins_employer_pct", "حصة المنشأة %"),
+            ("ins_min_wage", "الحد الأدنى للأجر التأميني"),
+            ("ins_max_wage", "الحد الأقصى للأجر التأميني"),
+        ]:
+            row = ttk.Frame(ins); row.pack(fill="x", padx=10, pady=3)
+            ttk.Label(row, text=label, width=26).pack(side="right", padx=4)
+            var = tk.StringVar()
+            ttk.Entry(row, textvariable=var, width=14).pack(side="right", padx=4)
+            self.st_hr_vars[key] = var
+
+        brk = ttk.LabelFrame(hr, text="شرائح ضريبة كسب العمل (استمارة 2)")
+        brk.pack(fill="both", expand=False, padx=12, pady=8)
+        ttk.Label(brk, text="من (جنيه/سنة)   |   إلى (0 = بدون حد)   |   النسبة %   |   البيان").pack(anchor="e", padx=10)
+        self.st_bracket_vars = []
+        self.brackets_box = ttk.Frame(brk); self.brackets_box.pack(fill="x", padx=10, pady=4)
+        ttk.Button(brk, text="+ إضافة شريحة", command=self.add_tax_bracket_row).pack(anchor="e", padx=10, pady=4)
+        row = ttk.Frame(hr); row.pack(fill="x", padx=12)
+        ttk.Label(row, text="التخفيض الضريبي السنوي").pack(side="right", padx=4)
+        self.st_hr_vars["tax_annual_relief"] = tk.StringVar()
+        ttk.Entry(row, textvariable=self.st_hr_vars["tax_annual_relief"], width=12).pack(side="right", padx=4)
+        ttk.Button(hr, text="حفظ إعدادات المرتبات", command=self.save_hr_settings).pack(anchor="e", padx=16, pady=10)
+
+        # ================================================================
+        # 5) المستخدمون والصلاحيات
+        # ================================================================
+        usr = self._screen(nb, "المستخدمون والصلاحيات")
+        top = ttk.Frame(usr); top.pack(fill="x", padx=10, pady=8)
+        ttk.Button(top, text="تحديث", command=self.refresh_settings_users).pack(side="left", padx=4)
+        ttk.Button(top, text="إضافة مستخدم", command=self.add_settings_user).pack(side="left", padx=4)
+        ttk.Button(top, text="إعادة تعيين كلمة المرور", command=self.reset_user_password).pack(side="left", padx=4)
+        ttk.Button(top, text="تفعيل/إيقاف", command=self.toggle_user_active).pack(side="left", padx=4)
+        tf, self.st_users_tree = self._tree(
+            usr, ("id", "username", "full_name", "role", "active", "created"),
+            ("#", "اسم المستخدم", "الاسم بالكامل", "الدور", "الحالة", "تاريخ الإنشاء"),
+            (50, 180, 260, 180, 100, 160))
         tf.pack(fill="both", expand=True, padx=10, pady=8)
 
-        imp = self._screen(nb, "استيراد البيانات من Excel")
-        ttk.Label(imp, text="استيراد اليومية الأمريكية أو المرتبات", style="Section.TLabel").pack(anchor="e", padx=10, pady=10)
-        ttk.Button(imp, text="استيراد اليومية", command=self.import_journal).pack(anchor="e", padx=10, pady=4)
-        ttk.Button(imp, text="استيراد المرتبات", command=self.import_payroll).pack(anchor="e", padx=10, pady=4)
+        roles_box = ttk.LabelFrame(usr, text="الأدوار والصلاحيات")
+        roles_box.pack(fill="x", padx=10, pady=8)
+        for rkey, rdata in ROLES.items():
+            rframe = ttk.Frame(roles_box); rframe.pack(fill="x", padx=8, pady=3)
+            ttk.Label(rframe, text=rdata["label"] + ":", width=18,
+                      font=("Tahoma", 10, "bold")).pack(side="right", padx=4)
+            perms = " | ".join(PERMISSION_LABELS.get(p, p) for p in sorted(rdata["permissions"]))
+            ttk.Label(rframe, text=perms, foreground="#444").pack(side="right", padx=4)
 
-        exp = self._screen(nb, "تصدير البيانات إلى Excel")
-        ttk.Label(exp, text="تصدير التقارير من الشاشات التشغيلية المختلفة", style="Section.TLabel").pack(anchor="e", padx=10, pady=10)
-        ttk.Button(exp, text="تصدير دفتر اليومية", command=self.export_journal).pack(anchor="e", padx=10, pady=4)
-        ttk.Button(exp, text="تصدير الميزان", command=self.export_trial).pack(anchor="e", padx=10, pady=4)
-        ttk.Button(exp, text="تصدير المرتبات", command=self.export_payroll).pack(anchor="e", padx=10, pady=4)
+        # ================================================================
+        # 6) سجل التدقيق والمراجعة
+        # ================================================================
+        aud = self._screen(nb, "سجل التدقيق")
+        top = ttk.Frame(aud); top.pack(fill="x", padx=10, pady=8)
+        ttk.Button(top, text="تحديث", command=self.refresh_audit_log).pack(side="left", padx=4)
+        ttk.Button(top, text="تصدير Excel", command=self.export_audit_log).pack(side="left", padx=4)
+        tf, self.audit_tree = self._tree(
+            aud, ("ts", "user", "action", "details"),
+            ("التاريخ/الوقت", "المستخدم", "العملية", "التفاصيل"),
+            (160, 160, 260, 700))
+        tf.pack(fill="both", expand=True, padx=10, pady=8)
 
-        backup = self._screen(nb, "النسخ الاحتياطي")
-        ttk.Label(backup, text="حفظ نسخة احتياطية من قاعدة البيانات", style="Section.TLabel").pack(anchor="e", padx=10, pady=10)
-        ttk.Button(backup, text="إنشاء نسخة احتياطية", command=self.backup_db).pack(anchor="e", padx=10)
+        # ================================================================
+        # 7) البيانات (الأشخاص / استيراد / تصدير / نسخ احتياطي)
+        # ================================================================
+        data = self._screen(nb, "البيانات والنسخ الاحتياطي")
+        people = ttk.LabelFrame(data, text="إدارة أسماء الأشخاص")
+        people.pack(fill="x", padx=10, pady=6)
+        ttk.Label(people, text="الأسماء المستخرجة من البيانات الحالية").pack(anchor="e", padx=10, pady=4)
+        tf, self.people_tree = self._tree(people, ("name",), ("الاسم",), (500,))
+        tf.pack(fill="x", padx=10, pady=6)
 
-        restore = self._screen(nb, "استرجاع النسخة الاحتياطية")
-        ttk.Label(restore, text="استرجاع نسخة قاعدة البيانات", style="Section.TLabel").pack(anchor="e", padx=10, pady=10)
-        ttk.Button(restore, text="استرجاع قاعدة بيانات", command=self.restore_db).pack(anchor="e", padx=10)
+        ops = ttk.LabelFrame(data, text="الاستيراد والتصدير والنسخ الاحتياطي")
+        ops.pack(fill="x", padx=10, pady=6)
+        ttk.Button(ops, text="استيراد اليومية الأمريكية", command=self.import_journal).pack(anchor="e", padx=10, pady=3)
+        ttk.Button(ops, text="استيراد المرتبات", command=self.import_payroll).pack(anchor="e", padx=10, pady=3)
+        ttk.Button(ops, text="تصدير دفتر اليومية", command=self.export_journal).pack(anchor="e", padx=10, pady=3)
+        ttk.Button(ops, text="تصدير الميزان", command=self.export_trial).pack(anchor="e", padx=10, pady=3)
+        ttk.Button(ops, text="تصدير المرتبات", command=self.export_payroll).pack(anchor="e", padx=10, pady=3)
+        ttk.Button(ops, text="إنشاء نسخة احتياطية", command=self.backup_db).pack(anchor="e", padx=10, pady=3)
+        ttk.Button(ops, text="استرجاع قاعدة بيانات", command=self.restore_db).pack(anchor="e", padx=10, pady=3)
 
-        if has_permission(self.current_user, PERM_USERS):
-            users_screen = self._screen(nb, "إدارة المستخدمين")
-            ttk.Label(users_screen, text="إدارة مستخدمي النظام والصلاحيات", style="Section.TLabel").pack(anchor="e", padx=10, pady=10)
-
-            add_box = ttk.LabelFrame(users_screen, text="إضافة مستخدم جديد")
-            add_box.pack(fill="x", padx=10, pady=6)
-            frm = ttk.Frame(add_box); frm.pack(fill="x", padx=10, pady=8)
-            self.user_username_var = tk.StringVar()
-            self.user_password_var = tk.StringVar()
-            self.user_fullname_var = tk.StringVar()
-            self.user_role_var = tk.StringVar(value=ROLE_VIEWER)
-            ttk.Label(frm, text="اسم المستخدم").pack(side="right", padx=4)
-            ttk.Entry(frm, textvariable=self.user_username_var, width=18).pack(side="right", padx=4)
-            ttk.Label(frm, text="كلمة المرور").pack(side="right", padx=4)
-            ttk.Entry(frm, textvariable=self.user_password_var, width=16).pack(side="right", padx=4)
-            ttk.Label(frm, text="الاسم الكامل").pack(side="right", padx=4)
-            ttk.Entry(frm, textvariable=self.user_fullname_var, width=22).pack(side="right", padx=4)
-            ttk.Label(frm, text="الصلاحية").pack(side="right", padx=4)
-            ttk.Combobox(frm, textvariable=self.user_role_var, values=list(ROLE_LABELS.values()), width=14, state="readonly").pack(side="right", padx=4)
-            ttk.Button(frm, text="إضافة المستخدم", command=self.add_user_action).pack(side="left", padx=6)
-
-            edit_box = ttk.LabelFrame(users_screen, text="تعديل مستخدم موجود")
-            edit_box.pack(fill="x", padx=10, pady=6)
-            frm2 = ttk.Frame(edit_box); frm2.pack(fill="x", padx=10, pady=8)
-            self.user_new_password_var = tk.StringVar()
-            ttk.Label(frm2, text="كلمة مرور جديدة (اتركها فارغة للإبقاء)").pack(side="right", padx=4)
-            pent = ttk.Entry(frm2, textvariable=self.user_new_password_var, width=16, show="*")
-            pent.pack(side="right", padx=4)
-            ttk.Button(frm2, text="حفظ التعديلات", command=self.update_selected_user).pack(side="left", padx=6)
-            ttk.Button(frm2, text="تعطيل/تفعيل", command=self.toggle_selected_user).pack(side="left", padx=6)
-            ttk.Button(frm2, text="حذف المستخدم", command=self.delete_selected_user).pack(side="left", padx=6)
-
-            tf, self.users_tree = self._tree(users_screen, ("id", "username", "full_name", "role", "status"),
-                                             ("رقم", "اسم المستخدم", "الاسم الكامل", "الصلاحية", "الحالة"),
-                                             (70, 160, 220, 180, 100))
-            tf.pack(fill="both", expand=True, padx=10, pady=8)
-            self.users_tree.bind("<<TreeviewSelect>>", lambda e: self.load_selected_user())
-
-        sysf = self._screen(nb, "إعدادات النظام")
-        txt = (
-            "إعدادات النظام الحالية:\n"
-            "- قاعدة بيانات SQLite محلية\n"
-            "- استيراد يومية أمريكية من Excel\n"
-            "- استيراد مرتبات من Excel\n"
-            "- تصدير الشاشات الرئيسية إلى Excel\n"
-            "- طباعة PDF لكل الشاشات: اليومية، الميزان، الأستاذ العام، كشوف المدينين، الإيرادات والمصروفات، المرتبات\n"
-            "- طباعة سندات رسمية: سند قيد وأذن صرف من الشاشة مباشرة\n"
-            "- مراكز تكلفة: إدارة المراكز وتوزيع سطور القيود عليها مع تقرير حركة\n"
-            "- يمكن تطوير الصلاحيات ومتعدد المستخدمين لاحقاً"
-        )
-        ttk.Label(sysf, text=txt, justify="right").pack(anchor="e", padx=10, pady=10)
-
-    # ---------- users actions ----------
-    def role_key_to_label(self, role):
-        return ROLE_LABELS.get(role, role)
-
-    def role_label_to_key(self, label):
-        for key, lbl in ROLE_LABELS.items():
-            if lbl == label:
-                return key
-        return ROLE_VIEWER
-
-    def load_selected_user(self):
-        sel = self.users_tree.selection()
-        if not sel:
+    # ---- إعدادات عامة ----
+    def pick_logo(self):
+        path = filedialog.askopenfilename(filetypes=[("صور", "*.png *.jpg *.jpeg *.bmp")])
+        if not path:
             return
-        vals = self.users_tree.item(sel[0], "values")
-        self.user_username_var.set(vals[1] if len(vals) > 1 else "")
+        set_setting("org_logo", path)
+        self.st_logo_lbl.config(text=os.path.basename(path))
+        self.log_audit("اختيار شعار", os.path.basename(path))
 
-    def refresh_users(self):
-        self._fill_tree(self.users_tree, [
-            (u["id"], u["username"], u["full_name"] or "", self.role_key_to_label(u["role"]),
-             "مفعل" if u["active"] else "معطل")
-            for u in users_list()
-        ])
+    def load_general_settings(self):
+        if not hasattr(self, "st_general_vars"):
+            return  # شاشة الإعدادات لم تُبنَ بعد
+        s = get_all_settings()
+        for key, var in self.st_general_vars.items():
+            var.set(str(s.get(key, "")))
+        for key, var in getattr(self, "st_tax_vars", {}).items():
+            var.set(str(s.get(key, "")))
+        if hasattr(self, "st_logo_lbl"):
+            self.st_logo_lbl.config(text=os.path.basename(s.get("org_logo", "")) if s.get("org_logo") else "لا يوجد شعار")
+        for key, var in getattr(self, "st_notify_vars", {}).items():
+            var.set(1 if str(s.get(key, "1")) in ("1", "True", "نعم") else 0)
+        if hasattr(self, "st_einvoice_var"):
+            self.st_einvoice_var.set(1 if str(s.get("einvoice_enabled", "0")) == "1" else 0)
+            self.st_env_var.set(str(s.get("einvoice_env", "test")))
+        for key, var in getattr(self, "st_hr_vars", {}).items():
+            var.set(str(s.get(key, "")))
+        if hasattr(self, "st_scope_var"):
+            cs = compliance_get_settings()
+            sc = cs.get("entity_scope", "union")
+            self.st_scope_var.set(f"{sc}: {'نقابة عامة' if sc == 'union' else 'لجنة نقابية'}")
+        self._load_tax_brackets()
 
-    def add_user_action(self):
-        role = self.role_label_to_key(self.user_role_var.get())
-        result = add_user(self.user_username_var.get(), self.user_password_var.get(),
-                          self.user_fullname_var.get(), role)
-        self.refresh_users()
-        messagebox.showinfo("المستخدمين", result)
+    def _load_tax_brackets(self):
+        if not hasattr(self, "brackets_box") or not hasattr(self, "st_bracket_vars"):
+            return
+        for child in self.brackets_box.winfo_children():
+            child.destroy()
+        self.st_bracket_vars = []
+        brackets = get_json_setting("tax_brackets", [])
+        for b in brackets:
+            self.add_tax_bracket_row(b.get("from", 0), b.get("to", 0), b.get("rate", 0), b.get("label", ""))
 
-    def get_selected_user_id(self):
-        sel = self.users_tree.selection()
+    def add_tax_bracket_row(self, frm="", to="", rate="", label=""):
+        row = ttk.Frame(self.brackets_box); row.pack(fill="x", pady=2)
+        vf = tk.StringVar(value=str(frm)); vt = tk.StringVar(value=str(to))
+        vr = tk.StringVar(value=str(rate)); vl = tk.StringVar(value=str(label))
+        ttk.Entry(row, textvariable=vl, width=26).pack(side="right", padx=3)
+        ttk.Entry(row, textvariable=vr, width=8).pack(side="right", padx=3)
+        ttk.Entry(row, textvariable=vt, width=12).pack(side="right", padx=3)
+        ttk.Entry(row, textvariable=vf, width=12).pack(side="right", padx=3)
+        ttk.Button(row, text="حذف", width=6, command=row.destroy).pack(side="right", padx=3)
+        self.st_bracket_vars.append((vf, vt, vr, vl))
+
+    def save_general_settings(self):
+        if not self.can("settings"):
+            self.deny(); return
+        mapping = {k: v.get() for k, v in self.st_general_vars.items()}
+        for k, v in self.st_notify_vars.items():
+            mapping[k] = str(v.get())
+        set_settings(mapping)
+        self.log_audit("تعديل إعدادات عامة", str(mapping))
+        messagebox.showinfo("تم", "تم حفظ إعدادات النظام العامة")
+
+    def save_tax_settings(self):
+        if not self.can("settings"):
+            self.deny(); return
+        mapping = {k: v.get() for k, v in self.st_tax_vars.items()}
+        mapping["einvoice_enabled"] = str(self.st_einvoice_var.get())
+        mapping["einvoice_env"] = self.st_env_var.get()
+        set_settings(mapping)
+        self.log_audit("تعديل إعدادات الضرائب", str(mapping))
+        messagebox.showinfo("تم", "تم حفظ إعدادات الحسابات والضرائب")
+
+    def save_hr_settings(self):
+        if not self.can("settings"):
+            self.deny(); return
+        import json as _json
+        mapping = {k: v.get() for k, v in self.st_hr_vars.items()}
+        brackets = []
+        for vf, vt, vr, vl in self.st_bracket_vars:
+            try:
+                brackets.append({"from": float(vf.get() or 0), "to": float(vt.get() or 0),
+                                 "rate": float(vr.get() or 0), "label": vl.get()})
+            except ValueError:
+                continue
+        mapping["tax_brackets"] = _json.dumps(brackets, ensure_ascii=False)
+        set_settings(mapping)
+        self.log_audit("تعديل إعدادات المرتبات", f"{len(brackets)} شريحة ضريبية")
+        messagebox.showinfo("تم", "تم حفظ إعدادات الموارد البشرية")
+
+    # ---- المستخدمون ----
+    def refresh_settings_users(self):
+        if not hasattr(self, "st_users_tree"):
+            return
+        for iid in self.st_users_tree.get_children():
+            self.st_users_tree.delete(iid)
+        for u in list_users():
+            self.st_users_tree.insert(
+                "", "end", iid=f"u{u['id']}",
+                values=(u["id"], u["username"], u["full_name"] or "",
+                        ROLES.get(u["role"], {}).get("label", u["role"]),
+                        "نشط" if u["active"] else "موقوف",
+                        u["created_at"] or ""))
+
+    def add_settings_user(self):
+        if not self.can("users_manage"):
+            self.deny("إدارة المستخدمين متاحة لمدير النظام فقط.")
+            return
+        from tkinter import simpledialog
+        uname = simpledialog.askstring("مستخدم جديد", "اسم المستخدم:", parent=self)
+        if not uname:
+            return
+        full = simpledialog.askstring("مستخدم جديد", "الاسم بالكامل:", parent=self) or ""
+        pwd = simpledialog.askstring("مستخدم جديد", "كلمة المرور:", parent=self, show="*")
+        if not pwd:
+            return
+        role = simpledialog.askstring("مستخدم جديد",
+                                      "الدور (admin / accountant / reviewer / viewer):",
+                                      initialvalue="viewer", parent=self) or "viewer"
+        try:
+            add_user(uname.strip(), full.strip(), pwd, role.strip())
+            self.log_audit("إضافة مستخدم", uname)
+            self.refresh_settings_users()
+            messagebox.showinfo("تم", "تم إضافة المستخدم")
+        except Exception as e:
+            messagebox.showerror("خطأ", str(e))
+
+    def _selected_user_id(self):
+        sel = self.st_users_tree.selection()
         if not sel:
+            messagebox.showinfo("تنبيه", "اختر مستخدماً أولاً")
             return None
-        return int(self.users_tree.item(sel[0], "values")[0])
+        return int(sel[0][1:])
 
-    def update_selected_user(self):
-        user_id = self.get_selected_user_id()
-        if not user_id:
-            messagebox.showwarning("تنبيه", "اختر مستخدماً من الجدول أولاً")
+    def reset_user_password(self):
+        if not self.can("users_manage"):
+            self.deny("إدارة المستخدمين متاحة لمدير النظام فقط.")
             return
-        vals = [self.users_tree.item(s, "values") for s in self.users_tree.selection()][0]
-        role = self.role_label_to_key(vals[3])
-        full_name = self.user_fullname_var.get() if self.user_fullname_var.get() else vals[2]
-        password = self.user_new_password_var.get()
-        result = update_user(user_id, full_name=full_name, role=role, password=password or None)
-        self.user_new_password_var.set("")
-        self.refresh_users()
-        messagebox.showinfo("المستخدمين", result)
+        uid = self._selected_user_id()
+        if not uid:
+            return
+        from tkinter import simpledialog
+        pwd = simpledialog.askstring("كلمة مرور جديدة", "كلمة المرور الجديدة:",
+                                     parent=self, show="*")
+        if not pwd:
+            return
+        update_user(uid, password=pwd)
+        self.log_audit("إعادة تعيين كلمة مرور", f"مستخدم رقم {uid}")
+        messagebox.showinfo("تم", "تم تحديث كلمة المرور")
 
-    def toggle_selected_user(self):
-        user_id = self.get_selected_user_id()
-        if not user_id:
-            messagebox.showwarning("تنبيه", "اختر مستخدماً من الجدول أولاً")
+    def toggle_user_active(self):
+        if not self.can("users_manage"):
+            self.deny("إدارة المستخدمين متاحة لمدير النظام فقط.")
             return
-        vals = [self.users_tree.item(s, "values") for s in self.users_tree.selection()][0]
-        current = 0 if vals[4] == "مفعل" else 1
-        update_user(user_id, active=bool(current))
-        self.refresh_users()
+        uid = self._selected_user_id()
+        if not uid:
+            return
+        if self.current_user and self.current_user.get("id") == uid:
+            messagebox.showwarning("تنبيه", "لا يمكنك إيقاف حسابك الحالي.")
+            return
+        row = next((u for u in list_users() if u["id"] == uid), None)
+        new_state = not bool(row["active"]) if row else True
+        update_user(uid, active=new_state)
+        self.log_audit("تفعيل/إيقاف مستخدم", f"{row['username']} -> {'نشط' if new_state else 'موقوف'}")
+        self.refresh_settings_users()
 
-    def delete_selected_user(self):
-        user_id = self.get_selected_user_id()
-        if not user_id:
-            messagebox.showwarning("تنبيه", "اختر مستخدماً من الجدول أولاً")
+    # ---- سجل التدقيق ----
+    def refresh_audit_log(self):
+        if not hasattr(self, "audit_tree"):
             return
-        if not messagebox.askyesno("تأكيد", "هل تريد حذف المستخدم المحدد؟"):
-            return
-        current_id = (self.current_user or {}).get("id")
-        result = delete_user(user_id, current_id)
-        self.refresh_users()
-        messagebox.showinfo("المستخدمين", result)
+        for iid in self.audit_tree.get_children():
+            self.audit_tree.delete(iid)
+        for r in list_audit():
+            self.audit_tree.insert("", "end", values=(r["ts"], r["username"], r["action"], r["details"] or ""))
+
+    def export_audit_log(self):
+        rows = [(r["ts"], r["username"], r["action"], r["details"] or "") for r in list_audit(5000)]
+        self.export_simple_excel(rows, ["التاريخ/الوقت", "المستخدم", "العملية", "التفاصيل"],
+                                 "سجل_التدقيق")
 
     # ---------- permissions ----------
     def _apply_permissions(self):
         user = self.current_user
-        if not user or user.get("role") == ROLE_ADMIN:
+        if not user or user.get("role") == "admin":
             return
 
         disabled_texts = []
-        if not has_permission(user, PERM_IMPORT):
+        if not user_can(user.get("role"), "import"):
             disabled_texts += ["استيراد اليومية", "استيراد المرتبات", "استيراد ملف المرتبات",
-                               "اختيار ملف واستيراد"]
-        if not has_permission(user, PERM_EDIT_ENTRIES):
-            disabled_texts += ["إضافة قيد", "تعديل القيد المحدد", "حذف القيد المحدد",
-                               "فتح شاشة الإضافة", "إضافة قيد جديد"]
-        if not has_permission(user, PERM_SETTLEMENTS):
-            disabled_texts += ["حفظ التسوية", "ترحيل الفروقات"]
-        if not has_permission(user, PERM_EXPORT):
+                               "اختيار ملف واستيراد", "استيراد اليومية الأمريكية"]
+        if not user_can(user.get("role"), "entries_edit"):
+            disabled_texts += ["إضافة قيد", "تعديل القيد المحدد",
+                               "فتح شاشة الإضافة", "إضافة قيد جديد",
+                               "حفظ التسوية", "ترحيل الفروقات"]
+        if not user_can(user.get("role"), "entries_delete"):
+            disabled_texts += ["حذف القيد المحدد"]
+        if not user_can(user.get("role"), "export"):
             disabled_texts += ["تصدير", "طباعة"]
-        if user.get("role") == ROLE_VIEWER:
-            disabled_texts += ["نسخة احتياطية", "استرجاع"]
+        if not user_can(user.get("role"), "backup"):
+            disabled_texts += ["نسخة احتياطية"]
+        if not user_can(user.get("role"), "restore"):
+            disabled_texts += ["استرجاع"]
+        if not user_can(user.get("role"), "compliance_rescan"):
+            disabled_texts += ["إعادة فحص كل القيود"]
+        if not user_can(user.get("role"), "compliance_ack"):
+            disabled_texts += ["اعتماد المحدد كاستثناء"]
+        if not user_can(user.get("role"), "settings"):
+            disabled_texts += ["حفظ حدود اللائحة", "حفظ الحدود", "حفظ إعدادات النظام العامة",
+                               "حفظ إعدادات الحسابات والضرائب", "حفظ إعدادات المرتبات",
+                               "استرجاع الحدود الافتراضية", "اختيار الشعار"]
+        if not user_can(user.get("role"), "users_manage"):
+            disabled_texts += ["إضافة مستخدم", "إعادة تعيين كلمة المرور", "تفعيل/إيقاف"]
 
         # تعطيل أزرار مراكز التكلفة الإدارية
-        if not has_permission(user, PERM_EDIT_ENTRIES):
+        if not user_can(user.get("role"), "entries_edit"):
             for btn in getattr(self, "cost_admin_buttons", []):
                 try:
                     btn.state(["disabled"])
@@ -2210,8 +2477,7 @@ class AccountingApp(tk.Tk):
         self.refresh_compliance_cash()
         self.refresh_compliance_live()
         self.refresh_compliance_badge()
-        if hasattr(self, "users_tree"):
-            self.refresh_users()
+        self.refresh_settings_users()
 
     def refresh_dashboard(self):
         data = dashboard_summary()
@@ -2265,6 +2531,9 @@ class AccountingApp(tk.Tk):
         EntryEditor(self, entry_id)
 
     def delete_selected_entry(self):
+        if not self.can("entries_delete"):
+            self.deny("دورك لا يسمح بحذف القيود.")
+            return
         entry_id = self.get_selected_entry_id()
         if not entry_id:
             messagebox.showwarning("تنبيه", "اختر قيداً أولاً")
@@ -2276,6 +2545,7 @@ class AccountingApp(tk.Tk):
         cur.execute("DELETE FROM journal_lines WHERE entry_id=?", (entry_id,))
         cur.execute("DELETE FROM journal_entries WHERE id=?", (entry_id,))
         conn.commit(); conn.close()
+        self.log_audit("حذف قيد", f"قيد رقم {entry_id}")
         self.refresh_all()
 
     def refresh_chart(self):
@@ -2547,7 +2817,7 @@ class LoginDialog(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self.cancel)
 
     def submit(self):
-        user = authenticate(self.username_var.get(), self.password_var.get())
+        user = verify_user(self.username_var.get(), self.password_var.get())
         if user:
             self.result = user
             self.destroy()

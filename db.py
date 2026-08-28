@@ -123,8 +123,14 @@ def init_db():
         password_hash TEXT NOT NULL,
         full_name TEXT,
         role TEXT DEFAULT 'viewer',
-        active INTEGER DEFAULT 1
+        active INTEGER DEFAULT 1,
+        created_at TEXT
     )""")
+
+    # ترحيل آمن للبيانات القديمة: إضافة عمود created_at لقواعد البيانات السابقة
+    ucols = [r[1] for r in cur.execute("PRAGMA table_info(users)").fetchall()]
+    if "created_at" not in ucols:
+        cur.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS bank_settlements (

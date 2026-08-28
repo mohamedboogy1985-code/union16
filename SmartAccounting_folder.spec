@@ -13,6 +13,8 @@ a = Analysis(
         'reportlab',
         'arabic_reshaper',
         'bidi',
+        'compliance',
+        'app_settings',
     ],
     hookspath=[],
     hooksconfig={},
